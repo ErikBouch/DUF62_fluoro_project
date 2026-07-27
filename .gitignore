@@ -1,0 +1,43 @@
+# =============================================================
+# DUF62_fluoro_project .gitignore
+# Public repository: code, notebooks, and READMEs are tracked.
+# Raw data + internal context live in the parent DUF_62 folder,
+# outside this repository. The entries below are mostly defensive.
+# =============================================================
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Python caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+*.env
+
+# --- Local IDE / editor state ---
+.vscode/
+.idea/
+.claude/
+
+# --- Local run/config/log artifacts ---
+configs/
+output/
+outputs/
+**/output/
+**/outputs/
+*.log
+
+# --- Defensive: never publish raw data or local context if copied in here ---
+data/
+CLAUDE.md
+TASKS.md
+PROMPTS.md
+
+# --- OS metadata ---
+.DS_Store
+Thumbs.db

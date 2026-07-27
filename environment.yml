@@ -1,0 +1,15 @@
+name: duf62-fluoro
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy         # array math
+  - pandas        # tabular output / CSV
+  - pyarrow       # parquet read/write (db_loader.py, build_suspect_library.py, run_match.py)
+  - rdkit         # structures, in-silico acylation, formula/mass (in-silico library step)
+  - streamlit     # GUI (main.py + each module's gui.py)
+  - plotly        # interactive plots in the GUI
+  - matplotlib    # static PNG figure export (mzml_tools/plotting.py)
+  - pip
+  - pip:
+      - pyopenms  # read/parse mzML spectra — not distributed via conda-forge, pip only

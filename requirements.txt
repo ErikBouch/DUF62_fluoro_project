@@ -1,0 +1,11 @@
+# DUF62 fluoro project — Python dependencies
+# (pip; note: rdkit is most reliable via conda-forge)
+
+pyopenms      # read/parse mzML spectra
+numpy         # array math
+pandas        # tabular output / CSV
+pyarrow       # parquet read/write (db_loader.py, build_suspect_library.py, run_match.py)
+rdkit         # structures, in-silico acylation, formula/mass (in-silico library step)
+streamlit     # GUI (main.py + each module's gui.py)
+plotly        # interactive plots in the GUI
+matplotlib    # static PNG figure export (mzml_tools/plotting.py)
