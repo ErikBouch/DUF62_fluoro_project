@@ -156,7 +156,9 @@ Streamlit page: shows stats for the merged structure table and the suspect
 library built from it (row counts, fluoroacetyl/acetyl breakdown, a preview),
 plus a button to (re)build the suspect library from the merged table without
 leaving the GUI — this calls `build_suspect_library.build_library` directly
-(same code path as the CLI), with a live progress readout.
+(same code path as the CLI), with a real progress bar (not just a spinner)
+driven by the same per-checkpoint fraction `build_library` already computes
+for its text log.
 
 ## Folders
 - `data/` — all of this module's tables live here: the merged structure table

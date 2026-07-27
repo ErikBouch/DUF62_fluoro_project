@@ -15,13 +15,16 @@ navigation/layout. Each downstream module lives in its own folder with:
   biggest ones (3000+ lines) hard to work with;
 - local `data/` and `output/` subfolders (gitignored).
 
-`main.py` imports each module's `gui.render()` and shows the selected one in
-the main area behind a sidebar radio — one running app, not the old
-one-window-per-step/subprocess model.
+`main.py` imports each module's `gui.render()` and shows every module inside
+its own tab — one running app, not the old one-window-per-step/subprocess
+model. Tabs (not a sidebar radio) specifically because Streamlit keeps every
+tab's contents mounted and its widget state intact regardless of which one is
+currently visible — switching tabs is a client-side toggle, not a script
+rerun, so settings in one module are never lost by looking at another.
 
 ```
 scripts/
-├── main.py                 # Streamlit entry: sidebar nav, calls each module's gui.render()
+├── main.py                 # Streamlit entry: tab nav, calls each module's gui.render()
 ├── common/
 │   └── ui.py                #   shared GUI helpers (file discovery, page header) — no science logic
 ├── mzml_tools/              # open/read/query mzML files

@@ -71,12 +71,14 @@ def render():
 
         primary_amine_df = unified[unified["has_primary_amine"]].reset_index(drop=True)
         status = st.empty()
+        progress_bar = st.progress(0.0)
         status.text(f"Processing {len(primary_amine_df)} primary-amine compounds...")
-        with st.spinner("Running acylation over the full library -- this can take a couple of minutes."):
-            mono_rows, multi_rows, n_processed, n_multisite, n_errors = build_library(
-                primary_amine_df, progress_every=2000, progress_callback=status.text,
-            )
+        mono_rows, multi_rows, n_processed, n_multisite, n_errors = build_library(
+            primary_amine_df, progress_every=1000, progress_callback=status.text,
+            progress_fraction_callback=progress_bar.progress,
+        )
         status.empty()
+        progress_bar.empty()
 
         import pandas as pd
 

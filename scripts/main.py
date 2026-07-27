@@ -6,6 +6,11 @@ module (mzml_tools, insilico_library, comparison) owns its own page in its
 `gui.py`, calling back into that module's own logic file. main.py never
 contains science logic itself.
 
+Navigation is tabs, not a sidebar radio: every module stays mounted and its
+widget state stays intact regardless of which tab is currently visible --
+switching tabs is a client-side toggle, not a script rerun, so settings in one
+module never disappear because another tab was open for a while.
+
 Run with:
     streamlit run main.py
 """
@@ -28,14 +33,14 @@ def _render(module_path: str):
 
 
 def main():
-    st.sidebar.title("DUF62 Fluoro Project")
-    choice = st.sidebar.radio("Module", list(PAGES))
-    st.sidebar.divider()
-    st.sidebar.caption(
+    st.title("DUF62 Fluoro Project")
+    st.caption(
         "Finding naturally fluoroacetylated plant metabolites via an in-silico "
         "suspect library matched against LC-HRMS data."
     )
-    _render(PAGES[choice])
+    for tab, module_path in zip(st.tabs(list(PAGES)), PAGES.values()):
+        with tab:
+            _render(module_path)
 
 
 if __name__ == "__main__":

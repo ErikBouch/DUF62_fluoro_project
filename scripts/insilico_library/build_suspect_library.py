@@ -46,13 +46,18 @@ _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 PARENT_COLS = ["inchikey", "formula", "exact_mass", "name", "organism", "source_db"]
 
 
-def build_library(df, progress_every: int = 2000, progress_callback=None) -> tuple[list[dict], list[dict], int, int, int]:
+def build_library(
+    df, progress_every: int = 2000, progress_callback=None, progress_fraction_callback=None,
+) -> tuple[list[dict], list[dict], int, int, int]:
     """
     Run both acylation reactions over every row of `df` (expected to already
     be filtered to primary-amine-bearing compounds).
 
     `progress_callback(message: str)`, if given, is called every
-    `progress_every` rows with a short status string (e.g. for a GUI spinner).
+    `progress_every` rows with a short status string (e.g. for a GUI log).
+    `progress_fraction_callback(fraction: float)`, if given, is called at the
+    same checkpoints with the 0.0-1.0 fraction of rows processed so far, for
+    driving an actual progress bar.
 
     Returns (mono_rows, multidegree_rows, n_processed, n_multisite, n_errors).
     """
@@ -120,7 +125,11 @@ def build_library(df, progress_every: int = 2000, progress_callback=None) -> tup
             print(f"  {message}", flush=True)
             if progress_callback:
                 progress_callback(message)
+            if progress_fraction_callback:
+                progress_fraction_callback(n_processed / total if total else 1.0)
 
+    if progress_fraction_callback:
+        progress_fraction_callback(1.0)
     return mono_rows, multidegree_rows, n_processed, n_multisite, n_errors
 
 

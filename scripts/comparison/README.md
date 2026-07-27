@@ -54,18 +54,72 @@ python run_match.py --check-acetyl-cooccurrence --acetyl-tolerance 5 --acetyl-un
 ```
 
 The GUI page (`gui.py`) exposes the same options, supports selecting several
-mzML files to match in one run, and caps the on-screen table (largest result
-sets can't be streamed to the browser in full) while still writing the
-complete result to `output/` when it's too large to offer as an in-browser
-download.
+mzML files to match in one run, shows a real progress bar (per-file and
+per-spectrum, not just a spinner), and caps the on-screen table (largest
+result sets can't be streamed to the browser in full) while still writing
+the complete result to `output/` when it's too large to offer as an
+in-browser download. See "Result visualizations" below for what's shown
+underneath the table.
+
+## Result visualizations (`plotting.py` + `gui.py`)
+
+Both the CLI (always) and the GUI (after every run) produce three figures,
+built from two new aggregation functions in `matcher.py`:
+
+- **`scan_count_breakdown`**: how many features clear each of a set of
+  minimum-consecutive-scans thresholds (the currently-applied
+  `--min-consecutive-scans` value plus 50/100/200/500) — rendered as a bar
+  chart. Direct answer to "how many real candidates survive a stricter cut."
+- **`top_structures_by_formula`**: the top 10 product formulas by total scan
+  evidence (summed `n_raw_hits` across every feature sharing that formula --
+  rewarding reproducibility over one broad peak in a single file),
+  deduplicated so isomers/salt forms sharing a formula aren't shown
+  redundantly. Rendered as an RDKit 2D structure grid (`product_smiles` is
+  already a suspect-library column) -- a real structure reads faster than an
+  InChIKey or a table row.
+- The RT-vs-mass scatter ("feature map") from before is kept, but shown last
+  -- it's a detail/exploration tool, not a summary.
+
+Both aggregation functions accept either the raw `candidate_table` (they
+collapse to features internally) or an already-computed `features_table` (to
+avoid recomputing) — the scan count always means the same thing (a real
+contiguous run) regardless of which view is currently selected.
+
+Figures are written to `output/figures/` automatically on every run (small
+PNGs, no reason to gate behind a button): `scan_count_breakdown.png`,
+`top_structures.png`, `feature_map.png`. The GUI renders the bar chart with
+Plotly (interactive) and the structure grid with `st.image` (inherently
+static either way); `plotting.py` holds the matplotlib/RDKit static-export
+versions of all three, following the same split already used in
+`mzml_tools/plotting.py`.
 
 **Note on raw output**: a match against a large candidate-mass list, at a
 loose tolerance, is expected to include a lot of coincidental overlap with
 background/isobaric ions — a raw hit alone is not a confirmed identification.
-Narrowing tolerance, restricting MS level/relative intensity, and the acetyl
-co-occurrence check are the filters currently available to turn this into a
-meaningful shortlist; RT-window and isotope-pattern filters are not
-implemented yet.
+Narrowing tolerance, restricting MS level/relative or absolute intensity, the
+minimum-consecutive-scans filter, and the RT-bound acetyl co-occurrence check
+are the filters currently available to turn this into a meaningful shortlist;
+isotope-pattern filters are not implemented yet.
+
+**Acetyl co-occurrence is RT-bound** (`--acetyl-rt-window`, default **2.0**
+minutes): the acetyl analog only counts as co-occurring if it's found within
+that many minutes of the fluoroacetyl hit's own RT, not just anywhere in the
+file. Structurally near-identical compounds (same skeleton, different acyl
+group) should co-elute or nearly so, so a same-file-anywhere match isn't
+real evidence on its own. `filter_acetyl_cooccurring` pulls out just that
+subset; `run_match.py` (with `--check-acetyl-cooccurrence`) writes it
+alongside the full table as `*_acetyl_cooccurring.parquet`/`.csv` (for both
+the raw and, if `--collapse-to-features` is also set, the feature table);
+the GUI shows the same subset in its own expander/download.
+
+**Minimum signal filters** (`--min-intensity`, default **50,000** raw
+instrument units; `--min-consecutive-scans`, default **3**): a hit only
+counts if its peak intensity clears the absolute floor *and* it's part of a
+run of at least that many scans in a row for the same file+product (RT within
+`--max-rt-gap`, default 0.1 min, of each other — see `collapse_to_features`
+for why RT rather than raw scan index defines "in a row"). Both cut out
+transient, single-scan noise and weak coincidental overlaps; set either to
+0/1 to disable.
 
 **Note on duplicate products**: different parent compounds (e.g. a salt form
 vs. the free base) can react to an identical product structure. The join back
@@ -73,13 +127,24 @@ to the library uses the library's own row index (not `product_inchikey`,
 which is not guaranteed unique) so both candidates are surfaced rather than
 one being silently dropped or the join exploding.
 
+**Note on raw hit counts**: a raw hit row is one (file, MS1 scan, library
+target) match -- a single real chromatographic peak typically contributes one
+row per scan it spans, so the raw row count is not a compound count and is
+expected to be much larger than the number of distinct products/parents
+actually detected. `summarize_candidate_table`/`format_summary` (both called
+automatically by `run_match.py` and the GUI) report that breakdown, and
+`collapse_to_features` merges same-file/same-product hits whose retention
+times are within a tolerance (`--max-rt-gap`, default 0.1 min) into one row
+per elution event -- available via `run_match.py --collapse-to-features` or
+the GUI's matching checkbox.
+
 ## Folders
 - `data/` — module-local scratch input (gitignored); the suspect library it
   reads lives in `insilico_library/data/`, not here.
 - `output/` — `candidate_table.parquet` / `.csv` land here (gitignored;
-  auto-created at runtime).
+  auto-created at runtime); `output/figures/` holds the exported PNGs.
 
 ## Status
-`matcher.py`, `run_match.py`, and `gui.py`: built and tested against real
-mzML data, including at full library scale. **Not yet built**: RT-window and
+`matcher.py`, `run_match.py`, `gui.py`, and `plotting.py`: built and tested
+against real mzML data, including at full library scale. **Not yet built**:
 isotope-pattern confirmation filters.
