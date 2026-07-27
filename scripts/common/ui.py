@@ -35,6 +35,28 @@ def find_mzml_files(root: str = DEFAULT_HRMS_DIR) -> list[tuple[str, str]]:
     return sorted(found, key=lambda pair: pair[0])
 
 
+def pick_mzml_files(root: str = DEFAULT_HRMS_DIR, key: str = "mzml_multiselect") -> list[str]:
+    """
+    Multi-file picker: a multiselect over discovered local mzML files, plus an
+    optional text area for additional custom paths (one per line). Starts with
+    nothing selected -- the caller always has to choose explicitly.
+
+    Returns a list of full paths (discovered + custom, order not guaranteed).
+    """
+    import streamlit as st
+
+    discovered = find_mzml_files(root)
+    labels = [label for label, _ in discovered]
+    by_label = dict(discovered)
+
+    chosen_labels = st.multiselect("mzML files", labels, default=[], key=key)
+    with st.expander("Add custom file paths (one per line)"):
+        custom_text = st.text_area("Custom paths", value="", key=f"{key}_custom", label_visibility="collapsed")
+    custom_paths = [line.strip() for line in custom_text.splitlines() if line.strip()]
+
+    return [by_label[label] for label in chosen_labels] + custom_paths
+
+
 def page_header(title: str, subtitle: str | None = None):
     """Consistent page title + optional subtitle, used at the top of each module page."""
     import streamlit as st

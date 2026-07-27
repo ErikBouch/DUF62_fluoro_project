@@ -150,6 +150,14 @@ python build_suspect_library.py --csv data/suspect_library.csv \
     --csv-multidegree data/suspect_library_multidegree.csv   # also write plain CSVs
 ```
 
+## `gui.py`
+
+Streamlit page: shows stats for the merged structure table and the suspect
+library built from it (row counts, fluoroacetyl/acetyl breakdown, a preview),
+plus a button to (re)build the suspect library from the merged table without
+leaving the GUI — this calls `build_suspect_library.build_library` directly
+(same code path as the CLI), with a live progress readout.
+
 ## Folders
 - `data/` — all of this module's tables live here: the merged structure table
   (`unified_structures.parquet` + a plain `.csv` copy) and the suspect library
@@ -163,8 +171,8 @@ python build_suspect_library.py --csv data/suspect_library.csv \
 ## Status
 `db_loader.py`: built, tested, and run successfully across all three sources.
 `acylation.py` + `benchmark_aa.py`: built and tested, including the optional
-multi-site (formula-only) calculation. `build_suspect_library.py`: built,
-tested, and run successfully over the full merged library.
+multi-site (formula-only) calculation. `build_suspect_library.py` + `gui.py`:
+built, tested, and run successfully over the full merged library.
 
-**Not yet built**: the actual matching step against real mzML data (that's the
-`comparison` module), and this module's own `gui.py` page (currently a placeholder).
+**Not yet built**: the actual matching step against real mzML data lives in
+the `comparison` module.

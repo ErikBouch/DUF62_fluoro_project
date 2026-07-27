@@ -46,10 +46,13 @@ _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 PARENT_COLS = ["inchikey", "formula", "exact_mass", "name", "organism", "source_db"]
 
 
-def build_library(df, progress_every: int = 2000) -> tuple[list[dict], list[dict], int, int, int]:
+def build_library(df, progress_every: int = 2000, progress_callback=None) -> tuple[list[dict], list[dict], int, int, int]:
     """
     Run both acylation reactions over every row of `df` (expected to already
     be filtered to primary-amine-bearing compounds).
+
+    `progress_callback(message: str)`, if given, is called every
+    `progress_every` rows with a short status string (e.g. for a GUI spinner).
 
     Returns (mono_rows, multidegree_rows, n_processed, n_multisite, n_errors).
     """
@@ -112,8 +115,11 @@ def build_library(df, progress_every: int = 2000) -> tuple[list[dict], list[dict
         if progress_every and n_processed % progress_every == 0:
             elapsed = time.time() - t0
             rate = n_processed / elapsed if elapsed > 0 else 0
-            print(f"  {n_processed}/{total} compounds processed, {len(mono_rows)} product rows so far, "
-                  f"{elapsed:.0f}s elapsed, {rate:.1f} compounds/s", flush=True)
+            message = (f"{n_processed}/{total} compounds processed, {len(mono_rows)} product rows so far, "
+                       f"{elapsed:.0f}s elapsed, {rate:.1f} compounds/s")
+            print(f"  {message}", flush=True)
+            if progress_callback:
+                progress_callback(message)
 
     return mono_rows, multidegree_rows, n_processed, n_multisite, n_errors
 
