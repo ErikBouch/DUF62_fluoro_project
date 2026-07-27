@@ -19,6 +19,7 @@ DUF62_fluoro_project/
 ├── .streamlit/config.toml # dark theme
 ├── requirements.txt
 ├── environment.yml       # conda alternative (recommended: rdkit is most reliable this way)
+├── CHANGELOG.md          # notable changes, newest first
 ├── README.md             # this file
 └── .gitignore
 ```

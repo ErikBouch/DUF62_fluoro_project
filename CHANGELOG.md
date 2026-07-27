@@ -3,6 +3,11 @@
 Notable changes to this repository, newest first. Dated by when the change
 was committed (not necessarily the same day it's pushed).
 
+## 2026-07-27 — List CHANGELOG.md in the README's directory tree
+
+### Fixed
+- Top-level `README.md` directory tree didn't mention `CHANGELOG.md`.
+
 ## 2026-07-27 — Add changelog
 
 ### Added
