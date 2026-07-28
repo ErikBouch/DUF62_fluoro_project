@@ -41,6 +41,15 @@ def _cached_library(path: str, _mtime: float):
     return pd.read_parquet(path)
 
 
+@st.cache_data(show_spinner=False)
+def _cached_structures_grid_image(top_df):
+    """Cached: Streamlit reruns this whole page on any widget interaction,
+    so without caching every one of the top 10 RDKit structures gets redrawn
+    from scratch on every unrelated click, not just when the result changes.
+    `top_df` only has 10 rows, so hashing it for the cache key is cheap."""
+    return plotting.build_top_structures_grid_image(top_df)
+
+
 def _render_table_with_download(df, sort_col: str, file_stem: str):
     """Shared display+download logic for both the raw-hit and feature tables:
     caps the on-screen preview and, when the full CSV is too large to stream
@@ -121,7 +130,17 @@ def _render_structure_grid(top_df):
         st.caption("No products to show yet.")
         return None
 
-    image = plotting.build_top_structures_grid_image(top_df)
+    error = plotting.structure_rendering_error()
+    if error:
+        st.warning(
+            "Structure rendering isn't available in this Python environment "
+            f"(`rdkit.Chem.Draw` failed to import: {error}). Everything else "
+            "on this page still works; this usually means rdkit needs "
+            "reinstalling in this environment."
+        )
+        return None
+
+    image = _cached_structures_grid_image(top_df)
     if image is None:
         st.caption("No parseable structures among the top candidates.")
         return None
@@ -299,6 +318,10 @@ def render():
     else:
         features_for_summary = features_for_viz
         st.caption(f"Based on all {len(features_for_viz)} features (acetyl co-occurrence wasn't checked).")
+
+    # Shared with the Molecule Explorer tab, so it browses the exact same
+    # final-filtered result rather than recomputing the acetyl filter itself.
+    st.session_state["cmp_features_for_summary"] = features_for_summary
 
     thresholds = tuple(sorted({min_consecutive_scans, 50, 100, 200, 500}))
     breakdown = scan_count_breakdown(candidate_table, thresholds=thresholds, features_table=features_for_summary)

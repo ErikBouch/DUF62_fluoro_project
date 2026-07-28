@@ -76,9 +76,18 @@ built from two new aggregation functions in `matcher.py`:
   deduplicated so isomers/salt forms sharing a formula aren't shown
   redundantly. Rendered as an RDKit 2D structure grid (`product_smiles` is
   already a suspect-library column) -- a real structure reads faster than an
-  InChIKey or a table row.
+  InChIKey or a table row. Since a formula bucket can pool several distinct
+  structures under one scan count, each card also reports `n_isomers`.
 - The RT-vs-mass scatter ("feature map") from before is kept, but shown last
   -- it's a detail/exploration tool, not a summary.
+
+`top_structures_by_formula` is a thin `.head(top_n)` wrapper around
+**`structures_by_formula`** (no cap, every formula, fully vectorized --
+no per-formula Python loop, so it stays fast over thousands of formulas),
+which is what the **Molecule Explorer** tab (`explorer/` module) pages
+through as a sortable, paginated gallery, along with **`isomers_for_formula`**
+for the "explore all isomers" drill-down when a formula pools more than one
+distinct structure. See `explorer/README.md`.
 
 Both aggregation functions accept either the raw `candidate_table` (they
 collapse to features internally) or an already-computed `features_table` (to
@@ -91,7 +100,23 @@ PNGs, no reason to gate behind a button): `scan_count_breakdown.png`,
 Plotly (interactive) and the structure grid with `st.image` (inherently
 static either way); `plotting.py` holds the matplotlib/RDKit static-export
 versions of all three, following the same split already used in
-`mzml_tools/plotting.py`.
+`mzml_tools/plotting.py`. `plotting.mol_image_data_uri` (SMILES -> a `data:`
+URI PNG) is shared with the Explorer tab's HTML cards.
+
+**Structure rendering degrades gracefully**: `rdkit.Chem.Draw` (the 2D
+depiction submodule, separate from the rest of RDKit) can fail to import on
+some installs -- e.g. a DLL-level ABI mismatch between conda-forge and
+default-channel builds of a shared dependency (`zlib`, on Windows, in
+practice). `plotting._get_draw_module`/`structure_rendering_error` catch that
+once and cache it, so every structure-rendering function returns `None`
+instead of raising; the GUI shows one warning and keeps the rest of the page
+(tables, charts, filters) working rather than crashing outright.
+
+**Note**: a missing `parent_name` is `NaN` (a float), not `None`, once it's
+round-tripped through a pandas column -- and `NaN` is truthy in plain Python,
+so a bare `if parent_name:`/`parent_name or default` silently lets it through
+instead of falling back, then crashes downstream (`len()` on a float). Any
+code touching `parent_name` checks `isinstance(parent_name, str)` instead.
 
 **Note on raw output**: a match against a large candidate-mass list, at a
 loose tolerance, is expected to include a lot of coincidental overlap with

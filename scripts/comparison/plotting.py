@@ -1,13 +1,14 @@
 """
-comparison/plotting.py — static figure export (matplotlib + RDKit), separate
-from matcher.py (pure matching/aggregation logic) and gui.py (interactive
-Streamlit/Plotly).
+comparison/plotting.py — figure/image rendering (matplotlib + RDKit),
+separate from matcher.py (pure matching/aggregation logic) and gui.py
+(interactive Streamlit/Plotly).
 
-For sharing results outside the live app (e.g. a PNG in output/figures/), not
-for the GUI itself -- the GUI renders the same underlying data (from
-matcher.scan_count_breakdown / matcher.top_structures_by_formula) with Plotly
-instead, except for the structure grid, which is inherently a static image
-either way.
+Most of this is static figure export for sharing results outside the live
+app (e.g. a PNG in output/figures/) -- the GUI renders the same underlying
+data (from matcher.scan_count_breakdown / matcher.structures_by_formula)
+with Plotly instead, except for structure images, which are inherently
+static either way (RDKit 2D depictions), so `mol_image_data_uri` is shared
+by both the static grid export and the GUI's Molecule Explorer cards.
 """
 from __future__ import annotations
 
@@ -24,6 +25,60 @@ _DARK_THEME = {
     "grid.color": "#334155",
     "font.size": 11,
 }
+
+
+_draw_module = None
+_draw_import_error = None
+_draw_import_attempted = False
+
+
+def _get_draw_module():
+    """Lazily import rdkit.Chem.Draw once, caching success or failure. A
+    broken RDKit/Cairo install (DLL load failures for rdMolDraw2D are a
+    known Windows issue, independent of the rest of RDKit -- Chem.* parsing
+    can work fine while Draw.* doesn't) shouldn't crash the whole page over
+    one feature; callers check this instead of importing directly."""
+    global _draw_module, _draw_import_error, _draw_import_attempted
+    if not _draw_import_attempted:
+        _draw_import_attempted = True
+        try:
+            from rdkit.Chem import Draw
+            _draw_module = Draw
+        except ImportError as exc:
+            _draw_import_error = exc
+    return _draw_module
+
+
+def structure_rendering_error() -> str | None:
+    """None if structure rendering is available; otherwise a short message
+    explaining why, for the GUI to show once instead of letting the
+    ImportError propagate and crash the page."""
+    _get_draw_module()
+    return str(_draw_import_error) if _draw_import_error else None
+
+
+def mol_image_data_uri(smiles: str | None, size=(220, 200)) -> str | None:
+    """SMILES -> a `data:` URI PNG, for embedding directly in an
+    `<img src="...">` tag (the Molecule Explorer's HTML cards). Returns None
+    for a missing/unparseable SMILES, or if structure rendering isn't
+    available at all (see `structure_rendering_error`)."""
+    draw = _get_draw_module()
+    if not smiles or draw is None:
+        return None
+
+    import base64
+    import io
+
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    img = draw.MolToImage(mol, size=size)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
 
 
 def save_scan_count_breakdown_figure(breakdown_df, out_path: str, title: str = "") -> str:
@@ -49,33 +104,118 @@ def save_scan_count_breakdown_figure(breakdown_df, out_path: str, title: str = "
     return out_path
 
 
-def build_top_structures_grid_image(top_df, mols_per_row: int = 5):
-    """RDKit structure grid for `matcher.top_structures_by_formula`'s output:
-    one 2D structure per row, labeled with formula + total scan count.
-    Returns a PIL Image, or None if no row has a parseable SMILES -- shared
-    by the GUI (`st.image`) and `save_top_structures_grid` so the (comparatively
-    expensive) RDKit rendering only happens once per run."""
-    from rdkit import Chem
-    from rdkit.Chem import Draw
+def _build_grid_image(entries, mols_per_row: int, struct_size, caption_h: int, font_sizes=(30, 18)):
+    """Shared PIL grid composer: one structure per cell (RDKit), with each
+    entry's own list of (text, is_big) caption lines drawn underneath in one
+    of two font sizes -- manual composition rather than RDKit's own grid-
+    legend mechanism, because RDKit auto-shrinks an entire cell's legend to
+    fit its single longest line, so one long line (lipid nomenclature can run
+    50+ characters) would drag every other line in that cell down to the
+    same tiny size. Also returns ONE image for however many entries there
+    are, rather than one image/element per entry -- at high entry counts (a
+    formula can pool dozens of isomers), embedding that many separate images
+    individually (e.g. as base64 HTML `<img>` tags) is far more expensive to
+    transmit/parse than one combined image via `st.image`, even though the
+    RDKit rendering cost itself is the same either way.
 
-    mols, legends = [], []
+    `entries`: list of {"mol": RDKit Mol, "lines": [(text, is_big), ...]}.
+    Returns a PIL Image, or None if `entries` is empty.
+    """
+    if not entries:
+        return None
+
+    rdkit_draw = _get_draw_module()
+    from PIL import Image, ImageDraw, ImageFont
+
+    cell_w, cell_h = struct_size[0], struct_size[1] + caption_h
+    n_rows = -(-len(entries) // mols_per_row)  # ceil
+    canvas = Image.new("RGB", (mols_per_row * cell_w, n_rows * cell_h), "white")
+    draw = ImageDraw.Draw(canvas)
+    font_big = ImageFont.load_default(size=font_sizes[0])
+    font_small = ImageFont.load_default(size=font_sizes[1])
+
+    for i, entry in enumerate(entries):
+        col, row_idx = i % mols_per_row, i // mols_per_row
+        x0, y0 = col * cell_w, row_idx * cell_h
+        struct_img = rdkit_draw.MolToImage(entry["mol"], size=struct_size)
+        canvas.paste(struct_img, (x0, y0))
+
+        y = y0 + struct_size[1] + 6
+        for line, is_big in entry["lines"]:
+            if not line:
+                continue
+            font = font_big if is_big else font_small
+            line_w = draw.textlength(line, font=font)
+            draw.text((x0 + (cell_w - line_w) / 2, y), line, fill="black", font=font)
+            y += font.size + 6
+
+    return canvas
+
+
+def build_top_structures_grid_image(top_df, mols_per_row: int = 5, struct_size=(400, 340)):
+    """Structure grid for `matcher.top_structures_by_formula`'s output: one
+    2D structure per row, captioned with formula + total scan count (large),
+    isomer count (large), and parent name (small, truncated).
+
+    Returns a PIL Image, or None if no row has a parseable SMILES, or if
+    structure rendering isn't available at all (see
+    `structure_rendering_error`) -- shared by the GUI (`st.image`) and
+    `save_top_structures_grid` so the (comparatively expensive) rendering
+    only happens once per run."""
+    if _get_draw_module() is None:
+        return None
+
+    from rdkit import Chem
+
+    entries = []
     for row in top_df.itertuples():
         smiles = getattr(row, "product_smiles", None)
         mol = Chem.MolFromSmiles(smiles) if smiles else None
         if mol is None:
             continue
-        label = f"{row.product_formula}\n{row.total_scans} scans"
         n_isomers = getattr(row, "n_isomers", 1)
-        if n_isomers > 1:
-            label += f"\n(1 of {n_isomers} structures)"
-        if getattr(row, "parent_name", None):
-            label += f"\n{row.parent_name}"
-        mols.append(mol)
-        legends.append(label)
+        parent_name = getattr(row, "parent_name", None)
+        parent_name = parent_name if isinstance(parent_name, str) else None
+        entries.append({
+            "mol": mol,
+            "lines": [
+                (f"{row.product_formula} -- {row.total_scans} scans", True),
+                (f"(1 of {n_isomers} structures)" if n_isomers > 1 else "", True),
+                ((parent_name if len(parent_name) <= 28 else parent_name[:25] + "...") if parent_name else "", False),
+            ],
+        })
+    return _build_grid_image(entries, mols_per_row, struct_size, caption_h=130, font_sizes=(30, 18))
 
-    if not mols:
+
+def build_isomer_grid_image(isomers_df, mols_per_row: int = 4, struct_size=(220, 190)):
+    """Structure grid for `matcher.isomers_for_formula`'s output: one 2D
+    structure per distinct isomer, captioned with scan count (large) and
+    parent name/InChIKey (small, truncated) -- the drill-down view for a
+    formula `build_top_structures_grid_image` only showed one representative
+    structure for (a formula bucket has pooled up to 80+ in practice).
+
+    Returns a PIL Image, or None if no row has a parseable SMILES, or if
+    structure rendering isn't available (see `structure_rendering_error`)."""
+    if _get_draw_module() is None:
         return None
-    return Draw.MolsToGridImage(mols, molsPerRow=mols_per_row, subImgSize=(220, 220), legends=legends)
+
+    from rdkit import Chem
+
+    entries = []
+    for row in isomers_df.itertuples():
+        smiles = getattr(row, "product_smiles", None)
+        mol = Chem.MolFromSmiles(smiles) if smiles else None
+        if mol is None:
+            continue
+        name = row.parent_name if isinstance(row.parent_name, str) else row.product_inchikey
+        entries.append({
+            "mol": mol,
+            "lines": [
+                (f"{row.total_scans} scans", True),
+                (name if len(name) <= 30 else name[:27] + "...", False),
+            ],
+        })
+    return _build_grid_image(entries, mols_per_row, struct_size, caption_h=70, font_sizes=(22, 15))
 
 
 def save_top_structures_grid(image, out_path: str) -> str | None:

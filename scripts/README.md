@@ -33,7 +33,8 @@ scripts/
 │   ├── data/                 #   input mzML (gitignored)
 │   └── output/               #   CSV exports (gitignored, auto-created)
 ├── insilico_library/        # merge NP databases + acylation logic; build/inspect the suspect library (CLI + GUI)
-└── comparison/               # match the suspect library against one or more mzML files (CLI + GUI)
+├── comparison/               # match the suspect library against one or more mzML files (CLI + GUI)
+└── explorer/                 # gallery view of a match's compound structures (sort, paginate, isomer drill-down)
 ```
 
 Each module's `data/`/`output/` are gitignored; `output/` is auto-created at
@@ -70,6 +71,6 @@ or `requirements.txt` (pip). Either way: `pyopenms`, `numpy`, `pandas`, `rdkit`,
 `streamlit`, `plotly`. A pip `.venv` at the repo root already has these
 installed (Python 3.14) for quick local testing.
 
-_Status: all three modules (`mzml_tools`, `insilico_library`, `comparison`)
-have both a tested logic file and a working `gui.py` page — see each module's
-own README for details._
+_Status: all four modules (`mzml_tools`, `insilico_library`, `comparison`,
+`explorer`) have both a tested logic file and a working `gui.py` page — see
+each module's own README for details._

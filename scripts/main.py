@@ -2,9 +2,9 @@
 main.py — DUF62 fluoro project GUI (Streamlit).
 
 The single entry point. It only handles navigation and layout; each downstream
-module (mzml_tools, insilico_library, comparison) owns its own page in its
-`gui.py`, calling back into that module's own logic file. main.py never
-contains science logic itself.
+module (mzml_tools, insilico_library, comparison, explorer) owns its own page
+in its `gui.py`, calling back into that module's own logic file. main.py
+never contains science logic itself.
 
 Navigation is tabs, not a sidebar radio: every module stays mounted and its
 widget state stays intact regardless of which tab is currently visible --
@@ -22,6 +22,7 @@ PAGES = {
     "mzML Scan Detector": "mzml_tools.gui",
     "In-silico Library": "insilico_library.gui",
     "MS Matching": "comparison.gui",
+    "Molecule Explorer": "explorer.gui",
 }
 
 

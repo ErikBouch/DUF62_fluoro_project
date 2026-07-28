@@ -550,29 +550,33 @@ def scan_count_breakdown(candidate_table, thresholds=(3, 50, 100, 200, 500), max
     return pd.DataFrame({"threshold": list(thresholds), "count": counts})
 
 
-def top_structures_by_formula(candidate_table, top_n=10, max_rt_gap_minutes=0.1, features_table=None):
+def structures_by_formula(candidate_table, max_rt_gap_minutes=0.1, features_table=None):
     """
-    The top `top_n` product formulas by total scan evidence -- summing
-    n_raw_hits across every feature sharing that formula, which rewards a
-    formula seen reproducibly (multiple features/files) over one broad but
-    isolated noisy peak in a single file. Deduplicated by formula so isomers/
-    salt forms that react to the same formula aren't shown as separate near-
-    identical entries.
+    Every product formula by total scan evidence -- summing n_raw_hits across
+    every feature sharing that formula, which rewards a formula seen
+    reproducibly (multiple features/files) over one broad but isolated noisy
+    peak in a single file. Deduplicated by formula so isomers/salt forms that
+    react to the same formula aren't shown as separate near-identical
+    entries. Fully vectorized (groupby/idxmax/map, no per-formula Python
+    loop) so it stays fast even over thousands of distinct formulas -- see
+    `top_structures_by_formula` for just the top N, and `isomers_for_formula`
+    for the individual structures pooled into one of these rows.
 
-    Same features_table reuse as `scan_count_breakdown`. `product_smiles` /
-    `parent_name` aren't columns on the (aggregated) features table, so
-    they're looked up back on `candidate_table` for the single feature with
-    the highest individual n_raw_hits per formula -- the best single example
-    to actually draw. A formula bucket often contains several distinct
-    structures (different product_inchikey values -- not necessarily true
-    isomers, e.g. many distinct lipid species can share one elemental
-    formula), not just one: only one is drawn, so `n_isomers` reports how
-    many distinct structures the pooled `total_scans` actually represents,
-    to make that dedup visible rather than silently misleading.
+    `product_smiles`/`parent_name`/`product_exact_mass` aren't columns on the
+    (aggregated) features table, so they're looked up back on
+    `candidate_table` for the single feature with the highest individual
+    n_raw_hits per formula -- the best single example to actually draw. A
+    formula bucket often contains several distinct structures (different
+    product_inchikey values -- not necessarily true isomers, e.g. many
+    distinct lipid species can share one elemental formula), not just one:
+    only one is drawn, so `n_isomers` reports how many distinct structures
+    the pooled `total_scans` actually represents, to make that dedup visible
+    rather than silently misleading.
 
-    Returns one row per formula: product_formula, total_scans, n_isomers,
-    product_smiles, parent_name, reaction, acetyl_cooccurs (of that
-    representative feature).
+    Returns one row per formula (sorted by total_scans, descending):
+    product_formula, total_scans, n_isomers, product_smiles, parent_name,
+    product_exact_mass, reaction, acetyl_cooccurs (of the representative
+    feature).
     """
     import pandas as pd
 
@@ -581,21 +585,69 @@ def top_structures_by_formula(candidate_table, top_n=10, max_rt_gap_minutes=0.1,
     if features_table.empty or "product_formula" not in features_table.columns:
         return pd.DataFrame()
 
-    totals = features_table.groupby("product_formula")["n_raw_hits"].sum().sort_values(ascending=False).head(top_n)
+    grouped = features_table.groupby("product_formula", sort=False)
+    totals = grouped["n_raw_hits"].sum()
+    n_isomers = grouped["product_inchikey"].nunique()
+    rep_features = features_table.loc[grouped["n_raw_hits"].idxmax()].set_index("product_formula")
 
-    rows = []
-    for formula, total in totals.items():
-        group = features_table[features_table["product_formula"] == formula]
-        rep_feature = group.loc[group["n_raw_hits"].idxmax()]
-        rep_hits = candidate_table[candidate_table["product_inchikey"] == rep_feature["product_inchikey"]]
-        rep_hit = rep_hits.iloc[0] if len(rep_hits) else None
-        rows.append({
-            "product_formula": formula,
-            "total_scans": int(total),
-            "n_isomers": int(group["product_inchikey"].nunique()),
-            "product_smiles": rep_hit["product_smiles"] if rep_hit is not None else None,
-            "parent_name": rep_hit["parent_name"] if rep_hit is not None else None,
-            "reaction": rep_feature.get("reaction"),
-            "acetyl_cooccurs": rep_feature.get("acetyl_cooccurs"),
-        })
-    return pd.DataFrame(rows)
+    lookup = candidate_table.drop_duplicates("product_inchikey").set_index("product_inchikey")
+    rep_inchikeys = rep_features["product_inchikey"]
+
+    result = pd.DataFrame({
+        "product_formula": totals.index,
+        "total_scans": totals.to_numpy(),
+        "n_isomers": n_isomers.reindex(totals.index).to_numpy(),
+        "product_smiles": rep_inchikeys.map(lookup["product_smiles"]).reindex(totals.index).to_numpy(),
+        "parent_name": rep_inchikeys.map(lookup["parent_name"]).reindex(totals.index).to_numpy(),
+        "product_exact_mass": rep_inchikeys.map(lookup["product_exact_mass"]).reindex(totals.index).to_numpy(),
+        "reaction": rep_features["reaction"].reindex(totals.index).to_numpy(),
+        "acetyl_cooccurs": rep_features["acetyl_cooccurs"].reindex(totals.index).to_numpy(),
+    })
+    return result.sort_values("total_scans", ascending=False).reset_index(drop=True)
+
+
+def top_structures_by_formula(candidate_table, top_n=10, max_rt_gap_minutes=0.1, features_table=None):
+    """The top `top_n` rows of `structures_by_formula` -- see that function
+    for what each column means."""
+    return structures_by_formula(candidate_table, max_rt_gap_minutes, features_table).head(top_n)
+
+
+def isomers_for_formula(formula, candidate_table, max_rt_gap_minutes=0.1, features_table=None):
+    """
+    Drill-down for one formula bucket from `structures_by_formula`: every
+    distinct structure (product_inchikey) sharing that formula, each with its
+    own scan evidence -- since `structures_by_formula` only surfaces a single
+    representative structure per formula (see its docstring), this is how to
+    see what else that formula's pooled `total_scans` was hiding.
+
+    Returns one row per distinct structure (sorted by total_scans,
+    descending): product_inchikey, total_scans, n_features, product_smiles,
+    parent_name, product_exact_mass, acetyl_cooccurs (true if any of that
+    structure's features co-occurred with acetyl).
+    """
+    import pandas as pd
+
+    if features_table is None:
+        features_table = collapse_to_features(candidate_table, max_rt_gap_minutes)
+    subset = features_table[features_table["product_formula"] == formula]
+    if subset.empty:
+        return pd.DataFrame()
+
+    grouped = subset.groupby("product_inchikey", sort=False)
+    totals = grouped["n_raw_hits"].sum()
+    n_features = grouped.size()
+    lookup = candidate_table.drop_duplicates("product_inchikey").set_index("product_inchikey")
+
+    result = pd.DataFrame({
+        "product_inchikey": totals.index,
+        "total_scans": totals.to_numpy(),
+        "n_features": n_features.reindex(totals.index).to_numpy(),
+    })
+    result["product_smiles"] = result["product_inchikey"].map(lookup["product_smiles"])
+    result["parent_name"] = result["product_inchikey"].map(lookup["parent_name"])
+    result["product_exact_mass"] = result["product_inchikey"].map(lookup["product_exact_mass"])
+    if subset["acetyl_cooccurs"].notna().any():
+        result["acetyl_cooccurs"] = result["product_inchikey"].map(grouped["acetyl_cooccurs"].any())
+    else:
+        result["acetyl_cooccurs"] = None
+    return result.sort_values("total_scans", ascending=False).reset_index(drop=True)

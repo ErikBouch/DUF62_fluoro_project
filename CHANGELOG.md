@@ -3,6 +3,59 @@
 Notable changes to this repository, newest first. Dated by when the change
 was committed (not necessarily the same day it's pushed).
 
+## 2026-07-27 — Speed up the Molecule Explorer
+
+### Fixed
+- Structure images (main grid and the isomer dialog) are now cached, keyed
+  on the molecule -- Streamlit reruns the whole page on any interaction
+  anywhere, so without caching every already-shown structure was being
+  redrawn from scratch every time, not just newly-shown ones.
+- The isomer drill-down dialog rendered one structure per widget (image +
+  several text elements); a formula pooling dozens of isomers turned into
+  hundreds of individual elements, which was far more expensive to
+  transmit/render than the actual structure drawing. Replaced with one
+  composed grid image (same approach as the top-10 structure grid) plus a
+  compact table for exact numbers.
+
+## 2026-07-27 — Degrade gracefully when RDKit's Draw module is unavailable
+
+### Fixed
+- A broken `rdkit.Chem.Draw` install (e.g. a DLL load failure) crashed the
+  whole MS Matching / Molecule Explorer page. Structure rendering now fails
+  gracefully with a one-time warning instead -- everything else on the page
+  (tables, charts, filters) still works.
+
+## 2026-07-27 — Add a Molecule Explorer tab
+
+### Added
+- New `explorer` module: a sortable, paginated gallery of the compound
+  structures from a MS Matching run (3 cards per row, 24 at a time, "load
+  more"). Each card shows the formula, scan count, and isomer count, with a
+  hover overlay for more detail and a click-through modal listing every
+  individual structure pooled into a formula with more than one.
+- `comparison/matcher.py`: `structures_by_formula` (every formula, not just
+  the top 10 -- vectorized, no per-formula loop) and `isomers_for_formula`
+  (drill-down for one formula's individual structures).
+- `comparison/plotting.py`: `mol_image_data_uri`, for embedding a structure
+  directly in an HTML card.
+
+### Fixed
+- A missing `parent_name` is `NaN` (truthy in Python), not `None` -- code
+  checking it with a bare `if`/`or` let it through and then crashed
+  formatting it. Fixed everywhere it's checked.
+
+## 2026-07-27 — Fix summary figures, sharpen the structure grid
+
+### Fixed
+- The scan-count bar chart and structure grid were built from all features,
+  not the acetyl-co-occurring subset when that check was enabled -- now
+  built from the final, most-filtered result.
+- `top_structures_by_formula` now reports how many distinct structures each
+  formula bucket pools together (`n_isomers`), shown on the structure grid,
+  since only one representative is ever drawn per formula.
+- The structure grid's resolution was too low to read the legend text at
+  normal zoom; roughly quadrupled (larger sub-image size, larger legend font).
+
 ## 2026-07-27 — Tab navigation, real progress bars, richer result visuals
 
 ### Changed
