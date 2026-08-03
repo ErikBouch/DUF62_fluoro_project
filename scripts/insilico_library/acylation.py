@@ -38,6 +38,14 @@ PROTON = 1.007276  # mass of H+, standard MS adduct convention
 # N with 2 H's, excluding amide (N-C=O) and sulfonamide (N-S(=O)(=O)) nitrogens.
 _AMINE_FILTER = "NX3H2;!$(NC(=O));!$(NS(=O)(=O))"
 
+# Human-readable name for the functional group `_AMINE_FILTER` targets --
+# primary amine is the only one implemented so far (chosen as the easiest
+# benchmark case), not a permanent assumption. Callers that report which
+# functional group a given run reacted on (e.g. a run summary) should read
+# this rather than hardcoding "primary amine" themselves, so adding a second
+# functional group later is a one-place change, not a find-and-replace.
+REACTIVE_GROUP_LABEL = "primary amine"
+
 REACTIONS = {
     "fluoroacetyl": rdChemReactions.ReactionFromSmarts(f"[{_AMINE_FILTER}:1]>>[N:1]C(=O)CF"),
     "acetyl": rdChemReactions.ReactionFromSmarts(f"[{_AMINE_FILTER}:1]>>[N:1]C(=O)C"),

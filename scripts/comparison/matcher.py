@@ -498,6 +498,10 @@ def collapse_to_features(candidate_table, max_rt_gap_minutes: float = 0.1, min_c
     features["apex_intensity"] = apex_rows["intensity"].to_numpy()
     features["apex_relative_intensity"] = apex_rows["relative_intensity"].to_numpy()
     features["apex_ppm_error"] = apex_rows["ppm_error"].to_numpy()
+    # The actual instrument-observed mass at the apex scan (as opposed to
+    # `product_exact_mass`, the theoretical value) -- needed to associate an
+    # MS2 scan by its own observed precursor m/z, see `ms2_confidence.py`.
+    features["apex_matched_mz"] = apex_rows["matched_mz"].to_numpy()
 
     n_parents = grouped["parent_inchikey"].nunique()
     single_parent = grouped["parent_inchikey"].first()

@@ -17,7 +17,23 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from comparison import plotting  # noqa: E402
 from comparison.matcher import isomers_for_formula, structures_by_formula  # noqa: E402
+from common.ui import persist, resolved_shared_mzml_files, restore  # noqa: E402
 from explorer.gallery import DEFAULT_SORT, PAGE_SIZE, SORT_OPTIONS, paginate, sort_structures  # noqa: E402
+
+# Reused directly from comparison/gui.py rather than duplicated: Molecule
+# Explorer's whole gallery reads the same `cmp_*` session_state keys MS
+# Matching's own page populates, so its own "load data" options call the
+# exact same loading/running logic MS Matching uses -- keeping both pages
+# in sync automatically instead of risking two paths that quietly diverge.
+# These names are underscore-prefixed in their home module (comparison's own
+# internal helpers, not a public API) -- imported anyway since the two
+# modules are tightly coupled by design (same session_state schema), and
+# duplicating this logic here would be the real drift risk.
+from comparison.gui import (  # noqa: E402
+    _OUTPUT_DIR as _COMPARISON_OUTPUT_DIR, _OUTPUT_VARIANT_LABELS,
+    _cached_library, _discover_output_variants, _find_saved_result, _load_output_variant,
+    _load_saved_result, _resolve_library_path, _run_match,
+)
 
 _CARD_CSS = """
 <style>
@@ -138,6 +154,140 @@ def _render_card(row):
                              st.session_state["cmp_features_for_summary"])
 
 
+def _render_show_current_results():
+    """
+    Option 1: the already-computed default result -- same resolution MS
+    Matching's own auto-load uses (`SHARED_CANDIDATE_TABLE_KEY`, falling back
+    to `comparison/output/candidate_table.parquet`), so pointing the Setup
+    page at a different saved result changes what this offers too.
+
+    Button first, status line right under it -- computed on every render
+    with no click needed, so "is this even possible right now" is always the
+    immediate answer, not something you find out only after pressing.
+    """
+    saved = _find_saved_result()
+    ready = saved is not None
+    if st.button("Show current results", key="explorer_btn_default", disabled=not ready):
+        with st.spinner("Loading saved result from disk..."):
+            _load_saved_result(saved)
+        st.rerun()
+
+    if ready:
+        import datetime
+
+        saved_when = datetime.datetime.fromtimestamp(saved["table_mtime"]).strftime("%Y-%m-%d %H:%M")
+        st.caption(f"Possible -- found `{saved['table_path']}` (saved {saved_when}).")
+    else:
+        st.caption(f"Not possible yet -- no saved result found at the default location (`{_COMPARISON_OUTPUT_DIR}`).")
+
+
+def _render_load_from_path_form():
+    """The actual folder/file picker, only ever shown once the button above
+    is pressed (see `_render_load_from_path`) -- not rendered unconditionally
+    on the page. A folder may hold several filter-variant files at once (raw
+    hits, acetyl-co-occurring subset, collapsed features, MS2-confident,
+    ...) -- offer the same "which result to view" selector MS Matching's own
+    output-variant browser already has, rather than assuming one specific
+    filename. A single file is loaded directly."""
+    restore("explorer_custom_path", "")
+    path = st.text_input(
+        "Folder or file path", key="explorer_custom_path",
+        help="A folder is scanned for known result files (candidate_table*/candidate_features*); "
+             "a specific file is loaded directly.",
+    )
+    persist("explorer_custom_path")
+    if not path:
+        return
+
+    if os.path.isdir(path):
+        variants = _discover_output_variants(path)
+        if not variants:
+            st.warning(f"No known result files found in `{path}`.")
+            return
+        variant_paths = list(variants.keys())
+        restore("explorer_variant_choice", variant_paths[0], valid_options=variant_paths)
+        choice = st.selectbox(
+            "Which result to view", variant_paths,
+            format_func=lambda p: variants[p], key="explorer_variant_choice",
+        )
+        persist("explorer_variant_choice")
+        if st.button("Load this result", key="explorer_load_variant"):
+            _load_output_variant(choice, variants[choice])
+            st.rerun()
+    elif os.path.isfile(path):
+        label = _OUTPUT_VARIANT_LABELS.get(os.path.basename(path), "Custom result file")
+        if st.button(f"Load `{os.path.basename(path)}`", key="explorer_load_file"):
+            _load_output_variant(path, label)
+            st.rerun()
+    else:
+        st.warning(f"No file or folder found at `{path}`.")
+
+
+def _render_load_from_path():
+    """
+    Option 2: any folder or file the user points at. Always "possible" (it
+    just needs a path, not any precondition) -- so unlike options 1 and 3,
+    the button here doesn't perform the load itself; it toggles whether the
+    actual picker (`_render_load_from_path_form`) is shown at all, since that
+    picker needs its own follow-up input/selection and would otherwise be a
+    text box and dropdown sitting on the page permanently, which is exactly
+    the "everything visible at once" clutter this redesign is fixing.
+    """
+    show = st.session_state.get("explorer_show_custom_path_form", False)
+    if st.button("Load from a folder or file", key="explorer_btn_custom_toggle"):
+        show = not show
+        st.session_state["explorer_show_custom_path_form"] = show
+    st.caption("Always possible -- point at any folder or a specific result file.")
+    if show:
+        _render_load_from_path_form()
+
+
+def _render_run_missing():
+    """
+    Option 3: run whatever's missing, then show the result. Checks
+    preconditions in order and only runs the step that can actually run
+    without further user input (a match, against the existing suspect
+    library + selected mzML files) -- Normalize needs the user's own column
+    mapping, so a missing suspect library is reported, not silently
+    guessed. Button first (disabled when not possible), status line right
+    under it explaining why, same pattern as the other two options.
+    """
+    library_path = _resolve_library_path()
+    file_paths = resolved_shared_mzml_files()
+
+    missing = []
+    if not os.path.isfile(library_path):
+        missing.append("no suspect library found (build one on In-silico Library)")
+    if not file_paths:
+        missing.append("no mzML files selected (pick some on Setup)")
+    ready = not missing
+
+    if st.button("Run match now", key="explorer_btn_run", disabled=not ready, type="primary" if ready else "secondary"):
+        library = _cached_library(library_path, os.path.getmtime(library_path))
+        with st.spinner("Running match..."):
+            candidate_table = _run_match(library, file_paths)
+        st.success(f"Match finished -- {len(candidate_table)} raw hits across {len(file_paths)} file(s).")
+        st.rerun()
+
+    if ready:
+        st.caption(
+            f"Possible -- suspect library + {len(file_paths)} mzML file(s) found. Runs with whatever "
+            "filter settings are currently set on the MS Matching page (or their defaults)."
+        )
+    else:
+        st.caption("Not possible yet -- " + "; ".join(missing) + ".")
+
+
+def _render_data_loader():
+    st.info("No data loaded yet.")
+
+    _render_show_current_results()
+    st.divider()
+    _render_load_from_path()
+    st.divider()
+    _render_run_missing()
+
+
 def render():
     st.title("Molecule Explorer")
     st.caption("Browse the compound structures surviving your last MS Matching run.")
@@ -145,7 +295,7 @@ def render():
     candidate_table = st.session_state.get("cmp_candidate_table")
     features_table = st.session_state.get("cmp_features_for_summary")
     if candidate_table is None or features_table is None or candidate_table.empty:
-        st.info("Run a match in the MS Matching tab first.")
+        _render_data_loader()
         return
 
     cache_key = (id(candidate_table), id(features_table))
@@ -172,7 +322,9 @@ def render():
 
     col1, col2 = st.columns([2, 1])
     col1.caption(f"{len(all_structures)} distinct product formulas.")
-    sort_label = col2.selectbox("Sort by", list(SORT_OPTIONS), index=list(SORT_OPTIONS).index(DEFAULT_SORT), key="explorer_sort")
+    restore("explorer_sort", DEFAULT_SORT, valid_options=list(SORT_OPTIONS))
+    sort_label = col2.selectbox("Sort by", list(SORT_OPTIONS), key="explorer_sort")
+    persist("explorer_sort")
 
     sorted_structures = sort_structures(all_structures, sort_label)
     n_loaded = st.session_state.get("explorer_n_loaded", PAGE_SIZE)

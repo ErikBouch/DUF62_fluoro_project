@@ -9,3 +9,4 @@ rdkit         # structures, in-silico acylation, formula/mass (in-silico library
 streamlit     # GUI (main.py + each module's gui.py)
 plotly        # interactive plots in the GUI
 matplotlib    # static PNG figure export (mzml_tools/plotting.py)
+jupyter       # run/edit notebooks/*.ipynb

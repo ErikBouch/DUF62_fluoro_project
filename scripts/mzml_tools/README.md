@@ -48,11 +48,22 @@ export_matches_csv(matches, "output/hits.csv")
 ```
 
 ## `gui.py`
-The Streamlit page (rendered from `main.py`): pick/enter an mzML file → see its
-overview → type a target m/z/tolerance/MS level/relative-intensity filter →
-run → sortable results table, CSV download, an interactive RT-vs-relative-
-intensity scatter (Plotly, sized by intensity, colored by MS level), and a
-"Compute XIC" button for a live extracted-ion chromatogram at any MS level.
+The Streamlit page (rendered from `main.py`): pick one or more mzML files (with
+a selector to switch which one is currently active) → see its overview → type
+a target m/z/tolerance/MS level/relative-intensity filter → run → sortable
+results table, CSV download, an interactive RT-vs-relative-intensity scatter
+(Plotly, sized by intensity, colored by MS level), and a "Compute XIC" button
+for a live extracted-ion chromatogram at any MS level.
+
+**Diagnostic ion targets**: a separate, curated list of candidate fragment-ion
+m/z values (add/remove, each with a "use in filter" checkbox and an "Explore"
+button that reuses the single-target search/XIC above against the active
+file). This list is persisted like every other setting (`restore`/`persist`,
+`diagnostic_targets` key), so it survives page navigation and saves/loads
+with a settings preset, and is read directly by MS Matching's MS2
+high-confidence filter -- no separate "apply" step, each target's own
+checkbox is the single source of truth for whether it's actually used there.
+See `comparison/README.md`.
 
 ## `plotting.py` (static PNG export, separate from the interactive GUI)
 For sharing results outside the app (e.g. sending a file directly) rather than

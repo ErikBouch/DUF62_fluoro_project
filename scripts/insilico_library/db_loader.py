@@ -4,12 +4,22 @@ deduplicated structure table.
 
 Logic only (no Streamlit import). Each `load_*` function normalizes one source
 into a common schema:
-    inchi, inchikey, smiles, name, organism, source_db, formula, exact_mass, has_primary_amine
+    inchi, inchikey, smiles, name, organism, source_db, formula
 
-`inchikey`, canonical `smiles`, `formula`, `exact_mass`, and `has_primary_amine`
-are always computed here via RDKit (not trusted from the source file), so
-every row is uniform and structure-valid regardless of where it came from.
-Rows RDKit can't parse are dropped (and counted).
+`inchikey`, canonical `smiles`, and `formula` are always computed here via
+RDKit (not trusted from the source file), so every row is uniform and
+structure-valid regardless of where it came from. Rows RDKit can't parse are
+dropped (and counted).
+
+Deliberately NOT part of this schema: `exact_mass` and `has_primary_amine`.
+Both are cheap, single-pass-recomputable properties of the structure that are
+specific to *later* pipeline steps (acylation needs `has_primary_amine` to
+pick a subset; the suspect library needs `exact_mass`/adduct masses), not
+something any of DNP/LOTUS/HMDB (or a user's own library) actually supplies --
+so they don't belong baked into what's otherwise meant to be a merged, but
+still input-shaped, structure table. `has_primary_amine`/`exact_mass` are
+computed on demand by `build_suspect_library.py` right before they're needed,
+via `compute_primary_amine_flags`/`compute_exact_mass_series` below.
 
 Merging is by `inchikey` (dedup key) -- the same structure found in multiple
 source DBs is kept once, with `source_db` recording every DB it appeared in.
@@ -42,7 +52,7 @@ class LoadStats:
 
 def _mol_row(mol, source_db: str, name=None, organism=None):
     from rdkit import Chem
-    from rdkit.Chem import Descriptors, rdMolDescriptors
+    from rdkit.Chem import rdMolDescriptors
 
     inchi = Chem.MolToInchi(mol)
     if not inchi:
@@ -58,9 +68,62 @@ def _mol_row(mol, source_db: str, name=None, organism=None):
         "organism": organism,
         "source_db": source_db,
         "formula": rdMolDescriptors.CalcMolFormula(mol),
-        "exact_mass": Descriptors.ExactMolWt(mol),
-        "has_primary_amine": mol.HasSubstructMatch(Chem.MolFromSmarts(PRIMARY_AMINE_SMARTS)),
     }
+
+
+def has_primary_amine(mol) -> bool:
+    """Same primary-amine definition acylation.py reacts on."""
+    from rdkit import Chem
+
+    return mol.HasSubstructMatch(Chem.MolFromSmarts(PRIMARY_AMINE_SMARTS))
+
+
+def _mol_from_inchi_safe(i):
+    """
+    `Chem.MolFromInchi` requires a real string and can still fail to parse
+    one -- neither is hypothetical here: a non-string value (e.g. `NaN`,
+    which is truthy in Python, so a bare `if i` guard doesn't catch it) would
+    otherwise raise a `Boost.Python.ArgumentError`, and even a genuine,
+    previously-valid InChI can fail to re-parse after a round trip through
+    parquet/pandas or for an unusual structure (RDKit isn't guaranteed to
+    accept every string it itself once produced) -- both are treated as "no
+    structure" rather than crashing.
+    """
+    from rdkit import Chem
+
+    if not isinstance(i, str) or not i:
+        return None
+    try:
+        return Chem.MolFromInchi(i)
+    except Exception:
+        return None
+
+
+def compute_primary_amine_flags(inchis) -> "pandas.Series":
+    """
+    Compute the `has_primary_amine` flag fresh from each row's InChI --
+    called right before it's needed (filtering to build the suspect library),
+    not stored as a persisted column on any merged/normalized table.
+    """
+    import pandas as pd
+
+    def _flag(i):
+        mol = _mol_from_inchi_safe(i)
+        return has_primary_amine(mol) if mol is not None else False
+
+    return pd.Series([_flag(i) for i in inchis], index=inchis.index if hasattr(inchis, "index") else None)
+
+
+def compute_exact_mass_series(inchis) -> "pandas.Series":
+    """Same idea as `compute_primary_amine_flags`, for `exact_mass`."""
+    import pandas as pd
+    from rdkit.Chem import Descriptors
+
+    def _mass(i):
+        mol = _mol_from_inchi_safe(i)
+        return Descriptors.ExactMolWt(mol) if mol is not None else None
+
+    return pd.Series([_mass(i) for i in inchis], index=inchis.index if hasattr(inchis, "index") else None)
 
 
 def _progress(source_db: str, seen: int, ok: int, t0: float, every: int):
@@ -179,6 +242,96 @@ def load_hmdb(xml_path: str, limit: int | None = None, progress_every: int = 200
     return rows, LoadStats("hmdb", seen, ok, failed)
 
 
+def load_user_table(
+    df, inchi_col: str | None = None, smiles_col: str | None = None,
+    name_col: str | None = None, organism_col: str | None = None,
+    source_label: str = "user", progress_every: int = 20000, progress_callback=None,
+    progress_fraction_callback=None, progress_fraction_every: int | None = None,
+) -> tuple[list[dict], LoadStats]:
+    """
+    Normalize an arbitrary user-supplied table (any columns) into the same
+    schema as `load_dnp`/`load_lotus`/`load_hmdb`. At least one of `inchi_col`/
+    `smiles_col` is required -- either is enough on its own, and both can be
+    given at once (InChI tried first per row, SMILES as a fallback for that
+    row if the InChI value is missing/unparseable). There's no equivalent
+    `inchikey_col`: an InChIKey is a one-way hash, so a table that has only
+    that (no InChI/SMILES) genuinely has no structure to recover -- it isn't a
+    valid input on its own.
+
+    Everything else in the schema (`inchikey`, canonical `smiles`, `formula`)
+    is computed here via RDKit exactly like the other loaders, never trusted
+    from the source table -- so a user's own formula/InChIKey columns, if any,
+    are simply ignored; there's nothing to map them to.
+
+    `progress_callback(message: str)` fires every `progress_every` rows (and
+    once more at the end) -- a console/status-text line, cheap enough to stay
+    coarse. `progress_fraction_callback(fraction: float)` -- the GUI's actual
+    progress-bar percentage -- fires on its own, much finer cadence instead:
+    every `progress_fraction_every` rows if given, else scaled to this
+    table's own size (`max(1, total // 300)`, ~300 updates total) so a small
+    table still updates smoothly and a huge one doesn't rack up hundreds of
+    thousands of individual bar-update calls for no perceptible benefit (past
+    a few hundred updates, a human can't tell the difference anyway -- the
+    per-call cost of driving the bar that often is pure overhead). A full
+    real-world library (hundreds of thousands of rows) can take tens of
+    minutes to parse, so a visible fraction matters here, not just for the
+    acylation step.
+    """
+    from rdkit import Chem
+
+    if not inchi_col and not smiles_col:
+        raise ValueError("load_user_table needs at least one of inchi_col/smiles_col")
+
+    rows = []
+    seen = ok = failed = 0
+    t0 = time.time()
+    total = len(df)
+    fraction_every = progress_fraction_every or max(1, total // 300)
+
+    for row in df.itertuples(index=False):
+        seen += 1
+        name = getattr(row, name_col) if name_col else None
+        organism = getattr(row, organism_col) if organism_col else None
+
+        mol = None
+        if inchi_col:
+            inchi_value = getattr(row, inchi_col)
+            if isinstance(inchi_value, str) and inchi_value.strip():
+                mol = Chem.MolFromInchi(inchi_value)
+        if mol is None and smiles_col:
+            smiles_value = getattr(row, smiles_col)
+            if isinstance(smiles_value, str) and smiles_value.strip():
+                mol = Chem.MolFromSmiles(smiles_value)
+        if mol is None:
+            failed += 1
+            continue
+
+        parsed_row = _mol_row(mol, source_label, name=name or None, organism=organism or None)
+        if parsed_row is None:
+            failed += 1
+            continue
+        rows.append(parsed_row)
+        ok += 1
+        if progress_every and seen % progress_every == 0:
+            elapsed = time.time() - t0
+            rate = seen / elapsed if elapsed > 0 else 0
+            message = f"{seen}/{total} rows, {ok} parsed ok, {elapsed:.0f}s elapsed, {rate:.0f} rec/s"
+            print(f"  [{source_label}] {message}", flush=True)
+            if progress_callback:
+                progress_callback(message)
+        if progress_fraction_callback and seen % fraction_every == 0:
+            progress_fraction_callback(seen / total if total else 1.0)
+
+    elapsed = time.time() - t0
+    done_message = f"Done: {seen}/{total} rows, {ok} parsed ok, {failed} failed ({elapsed:.0f}s elapsed)"
+    print(f"  [{source_label}] {done_message}", flush=True)
+    if progress_callback:
+        progress_callback(done_message)
+    if progress_fraction_callback:
+        progress_fraction_callback(1.0)
+    return rows, LoadStats(source_label, seen, ok, failed)
+
+
 def merge_rows(all_rows: list[list[dict]]) -> "pandas.DataFrame":
     """
     Concatenate normalized rows from multiple sources and dedupe by inchikey,
@@ -200,8 +353,6 @@ def merge_rows(all_rows: list[list[dict]]) -> "pandas.DataFrame":
                     "inchi": r["inchi"],
                     "smiles": r["smiles"],
                     "formula": r["formula"],
-                    "exact_mass": r["exact_mass"],
-                    "has_primary_amine": r["has_primary_amine"],
                     "name": r["name"],
                     "organism": r["organism"],
                     "source_db": {r["source_db"]},
@@ -277,7 +428,8 @@ def main(argv=None):
     print("Per-source stats:")
     for st in stats:
         print(f"  {st}")
-    print(f"Primary-amine-bearing structures: {int(merged['has_primary_amine'].sum())} / {len(merged)}")
+    n_amine = int(compute_primary_amine_flags(merged["inchi"]).sum())
+    print(f"Primary-amine-bearing structures: {n_amine} / {len(merged)}")
     print("Source DB combination counts:")
     print(merged["source_db"].value_counts().to_string())
 

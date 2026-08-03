@@ -12,7 +12,7 @@ import sys
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.ui import find_mzml_files, page_header  # noqa: E402
+from common.ui import page_header, persist, pick_mzml_files, resolved_shared_mzml_files, restore  # noqa: E402
 from mzml_tools.scan_detector import (  # noqa: E402
     extract_ion_chromatogram,
     find_scans_with_mz,
@@ -21,25 +21,118 @@ from mzml_tools.scan_detector import (  # noqa: E402
 
 
 @st.cache_data(show_spinner=False)
-def _cached_overview(path: str, _mtime: float):
+def _cached_overview(path: str, mtime: float):
+    # `mtime`, not a leading-underscore `_mtime`: Streamlit excludes any
+    # leading-underscore argument from the cache key entirely, so a changed
+    # file would otherwise silently keep returning the stale cached overview.
     return get_file_overview(path)
 
 
 @st.cache_data(show_spinner=False)
-def _cached_search(path: str, _mtime: float, target_mz, tol, unit, threshold, min_rel, ms_level):
+def _cached_search(path: str, mtime: float, target_mz, tol, unit, threshold, min_rel, ms_level):
     return find_scans_with_mz(path, target_mz, tol, unit, threshold, min_rel, ms_level)
 
 
-def _pick_file() -> str | None:
-    discovered = find_mzml_files()
-    options = ["-- choose a file --"] + [label for label, _ in discovered] + ["Custom path..."]
-    choice = st.selectbox("mzML file", options, key="scan_file_choice")
+def _pick_files() -> tuple[list[str], str | None]:
+    """
+    Multiple files can be picked at once (`pick_mzml_files`, shared with MS
+    Matching); when more than one is picked, a second selector chooses which
+    ONE is currently being explored below (file overview, single-target
+    search, XIC) -- "switch between them" rather than only ever working with
+    one file at a time. Returns (all picked paths, the currently active one).
+    """
+    file_paths = pick_mzml_files(key="scan_files", default=resolved_shared_mzml_files())
+    if not file_paths:
+        return [], None
+    if len(file_paths) == 1:
+        return file_paths, file_paths[0]
 
-    if choice == "-- choose a file --":
-        return None
-    if choice == "Custom path...":
-        return st.text_input("Full path to an .mzML file", key="scan_custom_path") or None
-    return dict(discovered)[choice]
+    labels = {path: os.path.basename(path) for path in file_paths}
+    restore("scan_active_file", file_paths[0], valid_options=file_paths)
+    active = st.selectbox(
+        "Exploring", file_paths, format_func=lambda p: labels[p], key="scan_active_file",
+    )
+    persist("scan_active_file")
+    return file_paths, active
+
+
+def _render_diagnostic_targets(active_path: str, active_mtime: float):
+    """
+    A curated list of candidate diagnostic fragment-ion m/z values, shared
+    with MS Matching's MS2 high-confidence filter. Persisted like every other
+    setting (`restore`/`persist`) so it survives page navigation *and*
+    saves/loads with a settings preset -- unlike a typical single-value
+    widget, this one is a whole list that gets mutated in place (append/
+    remove/per-item checkbox), so `persist()` is called again after every
+    such mutation rather than once right after a single widget. Each target
+    can be explored here individually (reuses the single-target search/XIC
+    below, against whichever file is currently active) before deciding
+    whether to actually use it in that filter -- adding a candidate ion to
+    try out shouldn't silently commit it.
+    """
+    restore("diagnostic_targets", [])
+    targets = st.session_state["diagnostic_targets"]
+    restore("_diagnostic_target_next_id", 0)
+    next_id = st.session_state["_diagnostic_target_next_id"]
+    # A widget's own session_state entry can only be set *before* that widget
+    # is instantiated in a given run -- so "clear the label/m/z fields after
+    # adding" can't happen inline in the button handler below (its widgets
+    # already rendered earlier in that same run). Defer it: the handler sets
+    # this flag and reruns; the *next* run clears both fields here, first.
+    if st.session_state.pop("_clear_new_target_fields", False):
+        st.session_state["new_target_label"] = ""
+        st.session_state["new_target_mz"] = 0.0
+
+    with st.expander(f"Diagnostic ion targets ({len(targets)})", expanded=bool(targets)):
+        st.caption(
+            "Candidate fragment-ion m/z values to check for in MS2 spectra. Explore one "
+            "against the currently active file above, then check \"use in filter\" to "
+            "include it in MS Matching's MS2 high-confidence filter."
+        )
+        for target in list(targets):
+            c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 1, 1])
+            c1.markdown(f"**{target['label']}**")
+            c2.markdown(f"m/z {target['target_mz']:.4f}")
+            target["use_in_filter"] = c3.checkbox(
+                "Use in filter", value=target["use_in_filter"], key=f"target_use_{target['id']}",
+            )
+            if c4.button("Explore", key=f"target_explore_{target['id']}"):
+                st.session_state["scan_target_mz"] = target["target_mz"]
+                tolerance = st.session_state.get("scan_tolerance", 25.0)
+                unit = st.session_state.get("scan_unit", "ppm")
+                threshold = st.session_state.get("scan_threshold", 0.0)
+                min_rel_pct = st.session_state.get("scan_min_rel", 2)
+                ms_level_choice = st.session_state.get("scan_ms_level", "2")
+                ms_level = None if ms_level_choice == "All" else int(ms_level_choice)
+                with st.spinner(f"Searching for {target['label']}..."):
+                    matches = _cached_search(
+                        active_path, active_mtime, target["target_mz"], tolerance, unit,
+                        threshold, min_rel_pct / 100.0, ms_level,
+                    )
+                st.session_state["scan_matches"] = matches
+                st.session_state["scan_matches_mz"] = target["target_mz"]
+            if c5.button("Remove", key=f"target_remove_{target['id']}"):
+                targets.remove(target)
+                persist("diagnostic_targets")
+                st.rerun()
+
+        # Persists every "use in filter" checkbox toggle from the loop above
+        # in one call, not once per existing target on every single rerun.
+        persist("diagnostic_targets")
+
+        st.divider()
+        col1, col2, col3 = st.columns([2, 2, 1])
+        new_label = col1.text_input("Label", key="new_target_label")
+        new_mz = col2.number_input("m/z", format="%.4f", key="new_target_mz")
+        if col3.button("Add target") and new_label.strip():
+            targets.append({
+                "id": next_id, "label": new_label.strip(), "target_mz": new_mz, "use_in_filter": True,
+            })
+            st.session_state["_diagnostic_target_next_id"] = next_id + 1
+            persist("_diagnostic_target_next_id")
+            persist("diagnostic_targets")
+            st.session_state["_clear_new_target_fields"] = True
+            st.rerun()
 
 
 def render():
@@ -48,7 +141,7 @@ def render():
         "Find scans containing a target m/z (within tolerance, above an intensity filter) and export them to CSV.",
     )
 
-    path = _pick_file()
+    _, path = _pick_files()
     if not path or not os.path.isfile(path):
         st.info("Pick or enter an .mzML file to begin.")
         return
@@ -73,22 +166,43 @@ def render():
             "low m/z, so small fragment ions may only be observable as MS2 product ions."
         )
 
-    if "scan_target_mz" not in st.session_state:
-        st.session_state["scan_target_mz"] = 100.0
+    # Restored *before* `_render_diagnostic_targets` below, not after: its
+    # "Explore" button reads these same keys directly (it reuses the
+    # single-target search against whatever tolerance/unit/etc. are
+    # currently set), and reading them before they've been restored this
+    # render would silently fall back to the hardcoded defaults below
+    # instead of the user's actual saved settings -- same class of bug as
+    # the shared mzML/library-path keys elsewhere in this app. `restore()`
+    # is a no-op the second time it's called for an already-set key, so the
+    # widgets further down are unaffected by restoring these this early.
+    restore("scan_target_mz", 100.0)
+    restore("scan_tolerance", 25.0)
+    restore("scan_unit", "ppm", valid_options=["ppm", "Da"])
+    restore("scan_ms_level", "2", valid_options=["All", "1", "2"])
+    restore("scan_min_rel", 2)
+    restore("scan_threshold", 0.0)
+
+    _render_diagnostic_targets(path, mtime)
 
     col1, col2, col3 = st.columns(3)
     target_mz = col1.number_input("Target m/z", format="%.4f", key="scan_target_mz")
-    tolerance = col2.number_input("Tolerance", value=25.0, min_value=0.1, key="scan_tolerance")
+    tolerance = col2.number_input("Tolerance", min_value=0.1, key="scan_tolerance")
     unit = col3.selectbox("Unit", ["ppm", "Da"], key="scan_unit")
+    persist("scan_target_mz")
+    persist("scan_tolerance")
+    persist("scan_unit")
 
     col4, col5 = st.columns(2)
-    ms_level_choice = col4.selectbox("MS level", ["All", "1", "2"], index=2, key="scan_ms_level")
+    ms_level_choice = col4.selectbox("MS level", ["All", "1", "2"], key="scan_ms_level")
     ms_level = None if ms_level_choice == "All" else int(ms_level_choice)
-    min_rel_pct = col5.slider("Min. relative intensity (% of that scan's base peak)", 0, 100, 2, key="scan_min_rel")
+    min_rel_pct = col5.slider("Min. relative intensity (% of that scan's base peak)", 0, 100, key="scan_min_rel")
     min_rel = min_rel_pct / 100.0
+    persist("scan_ms_level")
+    persist("scan_min_rel")
 
     with st.expander("Advanced"):
-        threshold = st.number_input("Min. absolute intensity (0 = off)", value=0.0, min_value=0.0, key="scan_threshold")
+        threshold = st.number_input("Min. absolute intensity (0 = off)", min_value=0.0, key="scan_threshold")
+        persist("scan_threshold")
 
     if st.button("Find scans", type="primary"):
         with st.spinner("Searching spectra..."):
@@ -145,7 +259,9 @@ def render():
         "chromatographic peak. Most meaningful at MS1 for an intact compound's own mass; "
         "MS2 fragment traces are noisier since many precursors share scan cycles."
     )
+    restore("xic_ms_level", "1", valid_options=["1", "2"])
     xic_ms_level = st.selectbox("XIC MS level", ["1", "2"], key="xic_ms_level")
+    persist("xic_ms_level")
     if st.button("Compute XIC"):
         with st.spinner("Building chromatogram..."):
             points = extract_ion_chromatogram(path, target_mz, tolerance, unit, int(xic_ms_level))

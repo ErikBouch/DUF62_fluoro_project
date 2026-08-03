@@ -10,6 +10,7 @@ dependencies:
   - streamlit     # GUI (main.py + each module's gui.py)
   - plotly        # interactive plots in the GUI
   - matplotlib    # static PNG figure export (mzml_tools/plotting.py)
+  - jupyter       # run/edit notebooks/*.ipynb
   - pip
   - pip:
       - pyopenms  # read/parse mzML spectra — not distributed via conda-forge, pip only

@@ -59,7 +59,10 @@ per-spectrum, not just a spinner), and caps the on-screen table (largest
 result sets can't be streamed to the browser in full) while still writing
 the complete result to `output/` when it's too large to offer as an
 in-browser download. See "Result visualizations" below for what's shown
-underneath the table.
+underneath the table. Filters keep their values when navigating to another
+page and back (`common.ui.restore`/`persist`); when a previous run already
+wrote `output/candidate_table.parquet`, a "load previously processed data"
+option reads it straight from disk instead of re-matching from scratch.
 
 ## Result visualizations (`plotting.py` + `gui.py`)
 
@@ -163,6 +166,41 @@ times are within a tolerance (`--max-rt-gap`, default 0.1 min) into one row
 per elution event -- available via `run_match.py --collapse-to-features` or
 the GUI's matching checkbox.
 
+## `ms2_confidence.py` (logic — no Streamlit import)
+
+An additional, opt-in filter on top of (not instead of) the result above:
+does a feature also have an MS2 scan that supports it?
+
+`find_ms2_support(features_df, diagnostic_targets, ...)` associates a feature
+with an MS2 scan from the same file by two conditions together, not
+precursor mass alone (many features can share a similar mass at very
+different retention times): the MS2 scan's own precursor m/z must be close
+to the feature's *observed* mass (`apex_matched_mz`, not the theoretical
+`product_exact_mass` -- `collapse_to_features` records it at the apex scan
+specifically for this), and its RT must be close to the feature's apex RT
+(DDA precursor selection happens on or very near the triggering MS1 scan).
+Each qualifying MS2 scan's peaks are then checked against every entry in
+`diagnostic_targets`. Adds three columns: `n_ms2_associated` (MS2 scans
+found near the feature, regardless of ion content -- useful on its own, as
+"does this feature have MS2 coverage at all"), `n_ms2_with_diagnostic_ion`,
+and `has_diagnostic_ms2`.
+
+`diagnostic_targets` (a list of `DiagnosticTarget(label, target_mz)`) is
+curated on the mzML Scan Detector page, not hardcoded -- see
+`mzml_tools/README.md`'s "Diagnostic ion targets" section. It's persisted the
+same way as every other setting (`restore`/`persist`), so it survives page
+navigation and saves/loads with a settings preset; this page pulls it in via
+`restore()` too (reading a *different* page's own widget key, same reasoning
+as `resolved_shared_mzml_files()`), filtered to each target's own "use in
+filter" checkbox, and exposes the
+precursor tolerance/RT window/ion tolerance as adjustable filters, with a
+"Run MS2 cross-check" button producing a downloadable table of the
+high-confidence subset. Verified against real data (a known, independently
+confirmed compound's feature): the association correctly found its one
+genuine nearby MS2 scan, and a real fragment peak from that scan was
+correctly flagged as a diagnostic-ion match while an arbitrary absent mass
+was correctly not.
+
 ## Folders
 - `data/` — module-local scratch input (gitignored); the suspect library it
   reads lives in `insilico_library/data/`, not here.
@@ -170,6 +208,6 @@ the GUI's matching checkbox.
   auto-created at runtime); `output/figures/` holds the exported PNGs.
 
 ## Status
-`matcher.py`, `run_match.py`, `gui.py`, and `plotting.py`: built and tested
-against real mzML data, including at full library scale. **Not yet built**:
-isotope-pattern confirmation filters.
+`matcher.py`, `run_match.py`, `gui.py`, `plotting.py`, and `ms2_confidence.py`:
+built and tested against real mzML data, including at full library scale.
+**Not yet built**: isotope-pattern confirmation filters.

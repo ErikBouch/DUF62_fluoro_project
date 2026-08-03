@@ -4,14 +4,22 @@ acylation reactions (acylation.py) over every primary-amine-bearing compound
 in the merged structure table (db_loader.py's output), producing the suspect
 library used for downstream mass matching.
 
-Reads data/unified_structures.parquet, filters to has_primary_amine == True,
-and for each remaining compound runs both acylate() reactions. Writes two
-tables:
-    data/suspect_library.parquet
+Reads a merged/normalized structure table (data/unified_structures.parquet by
+default, or any table produced by db_loader.py's loaders, including
+`load_user_table` for an arbitrary user-supplied library) -- a plain
+inchi/inchikey/smiles/formula/name/organism/source_db table, with no
+has_primary_amine or exact_mass columns of its own (those aren't things any
+source database supplies, so db_loader.py doesn't store them). Both are
+computed here, right before they're needed: has_primary_amine to filter down
+to the compounds actually worth reacting, exact_mass to carry through onto
+each product row. For each has_primary_amine compound, runs both acylate()
+reactions. Writes two tables (to output/ -- this is a computed result, not
+input data):
+    output/suspect_library.parquet
         One row per (parent compound, reaction, reactive site) -- the mono-
         acylation products, each with a real per-site InChI/SMILES/formula/
         mass and both [M+H]+ / [M-H]- adduct m/z values.
-    data/suspect_library_multidegree.parquet
+    output/suspect_library_multidegree.parquet
         Formula/mass only (no structure), one row per (parent compound,
         reaction, degree) for degree >= 2 -- only present for compounds with
         more than one independent reactive site.
@@ -35,11 +43,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rdkit import Chem, RDLogger  # noqa: E402
 
-from insilico_library.acylation import REACTIONS, acylate, multi_degree_formulas  # noqa: E402
+from insilico_library.acylation import REACTIONS, acylate, count_reactive_sites, multi_degree_formulas  # noqa: E402
+from insilico_library.db_loader import compute_exact_mass_series, compute_primary_amine_flags  # noqa: E402
 
 RDLogger.DisableLog("rdApp.*")
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 # Parent-compound columns carried through onto every product row, prefixed
 # with "parent_" so they can't collide with the product's own columns.
@@ -48,16 +58,22 @@ PARENT_COLS = ["inchikey", "formula", "exact_mass", "name", "organism", "source_
 
 def build_library(
     df, progress_every: int = 2000, progress_callback=None, progress_fraction_callback=None,
+    progress_fraction_every: int | None = None,
 ) -> tuple[list[dict], list[dict], int, int, int]:
     """
     Run both acylation reactions over every row of `df` (expected to already
     be filtered to primary-amine-bearing compounds).
 
     `progress_callback(message: str)`, if given, is called every
-    `progress_every` rows with a short status string (e.g. for a GUI log).
-    `progress_fraction_callback(fraction: float)`, if given, is called at the
-    same checkpoints with the 0.0-1.0 fraction of rows processed so far, for
-    driving an actual progress bar.
+    `progress_every` rows with a short status string (e.g. for a GUI log) --
+    a console/status-text cadence, cheap enough to stay coarse.
+    `progress_fraction_callback(fraction: float)` -- the GUI's actual
+    progress-bar percentage -- fires on its own, much finer cadence instead:
+    every `progress_fraction_every` rows if given, else scaled to `df`'s own
+    size (`max(1, total // 300)`, ~300 updates total), same reasoning as
+    `db_loader.load_user_table`'s equivalent split -- a fixed tiny interval
+    (e.g. every row) would mean hundreds of thousands of bar-update calls on
+    a real library, for no benefit a human could actually perceive.
 
     Returns (mono_rows, multidegree_rows, n_processed, n_multisite, n_errors).
     """
@@ -69,6 +85,7 @@ def build_library(
 
     total = len(df)
     t0 = time.time()
+    fraction_every = progress_fraction_every or max(1, total // 300)
 
     for row in df.itertuples(index=False):
         n_processed += 1
@@ -80,10 +97,21 @@ def build_library(
 
             parent = {f"parent_{col}": getattr(row, col) for col in PARENT_COLS}
 
-            max_sites = 0
+            # The true reactive-site count, NOT `len(products)`: for a
+            # symmetric multi-site molecule (a simple diamine, say -- two
+            # equivalent amines), `acylate()` dedupes its output by product
+            # InChIKey, so both sites yield the *same* product and
+            # `len(products)` under-counts as 1 -- which silently skipped
+            # the degree>=2 (both-ends-acylated) row for every symmetric
+            # multi-site compound, `multi_degree_formulas()` (which counts
+            # sites independently of product identity) never even being
+            # called. Confirmed directly against a symmetric test diamine:
+            # 2 reactive sites, 1 deduped mono-product, but a real degree-2
+            # product that `multi_degree_formulas()` does compute correctly
+            # once actually asked.
+            max_sites = count_reactive_sites(mol)
             for reaction in REACTIONS:
                 products = acylate(mol, reaction)
-                max_sites = max(max_sites, len(products))
                 for site_index, product in enumerate(products):
                     mono_rows.append({
                         **parent,
@@ -125,9 +153,15 @@ def build_library(
             print(f"  {message}", flush=True)
             if progress_callback:
                 progress_callback(message)
-            if progress_fraction_callback:
-                progress_fraction_callback(n_processed / total if total else 1.0)
+        if progress_fraction_callback and n_processed % fraction_every == 0:
+            progress_fraction_callback(n_processed / total if total else 1.0)
 
+    elapsed = time.time() - t0
+    done_message = (f"Done: {n_processed}/{total} compounds processed, {len(mono_rows)} product rows "
+                     f"({n_multisite} multi-site, {n_errors} errors), {elapsed:.0f}s elapsed")
+    print(f"  {done_message}", flush=True)
+    if progress_callback:
+        progress_callback(done_message)
     if progress_fraction_callback:
         progress_fraction_callback(1.0)
     return mono_rows, multidegree_rows, n_processed, n_multisite, n_errors
@@ -142,9 +176,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=None,
                    help="limit the number of primary-amine compounds processed (for a quick test run)")
     p.add_argument("--progress-every", type=int, default=2000)
-    p.add_argument("-o", "--output", default=os.path.join(_DATA_DIR, "suspect_library.parquet"),
+    p.add_argument("-o", "--output", default=os.path.join(_OUTPUT_DIR, "suspect_library.parquet"),
                    help="output path for the mono-acylation table")
-    p.add_argument("--output-multidegree", default=os.path.join(_DATA_DIR, "suspect_library_multidegree.parquet"),
+    p.add_argument("--output-multidegree", default=os.path.join(_OUTPUT_DIR, "suspect_library_multidegree.parquet"),
                    help="output path for the degree>=2 formula-only table")
     p.add_argument("--csv", default=None,
                    help="also write a plain (uncompressed) human-readable .csv copy of the mono-acylation table")
@@ -160,9 +194,15 @@ def main(argv=None):
 
     print(f"Loading {args.input} ...", flush=True)
     df = pd.read_parquet(args.input)
-    df = df[df["has_primary_amine"]].reset_index(drop=True)
+    # `--limit` slices *before* the RDKit primary-amine/mass computation, not
+    # after -- both run over the whole table otherwise, defeating the whole
+    # point of "a quick test run" (its own --help text) for a real,
+    # hundreds-of-thousands-of-rows library, where that computation alone is
+    # the expensive part, not the acylation step limit was actually bounding.
     if args.limit is not None:
         df = df.iloc[:args.limit]
+    df = df[compute_primary_amine_flags(df["inchi"])].reset_index(drop=True)
+    df["exact_mass"] = compute_exact_mass_series(df["inchi"])
     print(f"{len(df)} primary-amine compound(s) to process.", flush=True)
 
     mono_rows, multidegree_rows, n_processed, n_multisite, n_errors = build_library(

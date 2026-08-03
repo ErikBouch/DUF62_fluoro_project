@@ -20,14 +20,14 @@ from comparison.matcher import (  # noqa: E402
     scan_count_breakdown, summarize_candidate_table, top_structures_by_formula,
 )
 
-_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "insilico_library", "data")
+_LIBRARY_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "insilico_library", "output")
 _OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Match the suspect library against local mzML files.")
-    p.add_argument("--library", default=os.path.join(_DATA_DIR, "suspect_library.parquet"))
+    p.add_argument("--library", default=os.path.join(_LIBRARY_OUTPUT_DIR, "suspect_library.parquet"))
     p.add_argument("--limit", type=int, default=None, help="limit library rows searched (for a quick test run)")
     p.add_argument("--tolerance", type=float, default=0.002, help="fluoroacetyl match tolerance (default: 0.002 Da)")
     p.add_argument("--unit", choices=["Da", "ppm"], default="Da")

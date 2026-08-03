@@ -41,19 +41,24 @@ def save_xic_figure(
     points = extract_ion_chromatogram(mzml_path, target_mz, tolerance, unit, ms_level)
     rt = [p.rt_minutes for p in points]
     inten = [p.intensity for p in points]
-    apex = max(points, key=lambda p: p.intensity)
+    # `points` can legitimately be empty (e.g. an MS2 XIC requested against a
+    # file with no MS2 scans at all) -- `max()` raises on an empty sequence,
+    # so guard it the same way `save_hit_scatter_figure` already guards its
+    # own possibly-empty `matches` list, rather than crashing.
+    apex = max(points, key=lambda p: p.intensity) if points else None
 
     with plt.rc_context(_DARK_THEME):
         fig, ax = plt.subplots(figsize=(9, 4.5))
         ax.plot(rt, inten, color="#2dd4bf", linewidth=1.3)
         ax.fill_between(rt, inten, color="#2dd4bf", alpha=0.15)
-        ax.annotate(
-            f"apex: RT {apex.rt_minutes:.2f} min\nintensity {apex.intensity:.2e}",
-            xy=(apex.rt_minutes, apex.intensity),
-            xytext=(apex.rt_minutes + 1.5, apex.intensity * 0.85),
-            arrowprops=dict(arrowstyle="->", color="#e2e8f0"),
-            fontsize=9,
-        )
+        if apex is not None:
+            ax.annotate(
+                f"apex: RT {apex.rt_minutes:.2f} min\nintensity {apex.intensity:.2e}",
+                xy=(apex.rt_minutes, apex.intensity),
+                xytext=(apex.rt_minutes + 1.5, apex.intensity * 0.85),
+                arrowprops=dict(arrowstyle="->", color="#e2e8f0"),
+                fontsize=9,
+            )
         ax.set_xlabel("Retention time (min)")
         ax.set_ylabel("Intensity")
         subtitle = f"target m/z {target_mz:.4f} (MS{ms_level}, {tolerance} {unit})"

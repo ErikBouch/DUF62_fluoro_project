@@ -29,13 +29,22 @@ uniform schema:
 | `inchikey` | dedup key; **always computed by RDKit here**, never trusted from source |
 | `inchi` | canonical join field; present in or derivable from all three sources |
 | `smiles` | canonical SMILES, computed by RDKit (not each source's own string) |
-| `formula`, `exact_mass` | computed once here via RDKit; reused by later acylation math |
-| `has_primary_amine` | SMARTS `[NX3H2;!$(NC(=O));!$(NS(=O)(=O))]` — excludes amide/sulfonamide N; first-pass heuristic |
+| `formula` | computed once here via RDKit |
 | `name` | from LOTUS/HMDB where available |
 | `organism` | from DNP only (messy free text) |
 | `source_db` | comma-joined set, e.g. `"dnp,lotus"` — which DB(s) this structure was found in |
 
 Rows RDKit can't parse are dropped (and counted in the per-source `LoadStats`).
+
+**Deliberately not in this schema**: `exact_mass` and `has_primary_amine`.
+Neither is something any of DNP/LOTUS/HMDB (or a user's own library) actually
+supplies — both are specific to *later* pipeline steps (picking which
+compounds to acylate, and computing adduct masses), so storing them here would
+blur what's genuinely raw/merged input vs. computed downstream. Both are cheap
+to recompute from `inchi` — `has_primary_amine(mol)` /
+`compute_primary_amine_flags(inchis)` and `compute_exact_mass_series(inchis)`
+— called right where they're actually needed (`build_suspect_library.py`, the
+GUI's "Build" step), never persisted on the merged/normalized table.
 
 **Merging**: single-pass dict merge keyed by `inchikey` (not
 `groupby().apply()` — far too slow in pandas at large row counts). The same
@@ -51,7 +60,11 @@ python db_loader.py --dnp <dnp.tsv> --lotus <lotus.sdf> --hmdb <hmdb.xml> \
 ```
 
 The merged table is **input data** for later steps (acylation, matching), not
-a generated result — hence `data/`, not `output/`.
+a generated result — hence `data/`, not `output/`. The actual `data/unified_structures.parquet`
+this repo's own pipeline uses is produced by `../../notebooks/build_unified_library.ipynb`
+instead of a bare CLI call, so the merge process itself is documented with its
+real output (the three source DBs are outside the repo, so re-running that
+notebook needs your own local copies — reading it doesn't).
 
 ### Usage (import)
 ```python
@@ -60,6 +73,28 @@ dnp_rows, _ = load_dnp("dnp.tsv")
 lotus_rows, _ = load_lotus("lotus.sdf")
 hmdb_rows, _ = load_hmdb("hmdb.xml")
 df = merge_rows([dnp_rows, lotus_rows, hmdb_rows])
+```
+
+### Arbitrary user-supplied libraries: `load_user_table`
+
+Not every library comes as DNP/LOTUS/HMDB. `load_user_table(df, inchi_col=None,
+smiles_col=None, name_col=None, organism_col=None, source_label="user")`
+normalizes *any* dataframe into the same schema -- at least one of `inchi_col`/
+`smiles_col` is required, either is sufficient on its own, and both can be
+given together (InChI tried first per row, SMILES as a fallback for that row
+if the InChI value is missing/unparseable, same fallback `load_hmdb` uses
+internally). There's no `inchikey_col`: an InChIKey is a one-way hash, so a
+row that only has one has no structure to recover from it -- InChI or SMILES
+is the only valid structure input. Everything else in the schema (`inchikey`,
+canonical `smiles`, `formula`) is computed from whichever structure is found,
+exactly like the other loaders -- a user's own formula/InChIKey columns, if
+any, are never read; there's nothing to map them to. This is what the GUI's
+column-mapping step (below) calls.
+
+```python
+from insilico_library.db_loader import load_user_table, merge_rows
+rows, stats = load_user_table(my_df, smiles_col="smiles", name_col="compound_name")
+normalized = merge_rows([rows])
 ```
 
 ## `acylation.py` (logic — no Streamlit import)
@@ -133,10 +168,12 @@ python benchmark_aa.py
 
 ## `build_suspect_library.py`
 
-Runs the acylation reactions over the *full* merged structure table (not just
-the 20-AA benchmark): filters `unified_structures.parquet` to
-`has_primary_amine == True`, then runs both `acylate()` reactions on every
-remaining compound. Writes two tables under `data/`: the mono-acylation
+Runs the acylation reactions over a *full* normalized structure table (not
+just the 20-AA benchmark): computes `has_primary_amine` fresh from each row's
+`inchi` (not read as a stored column -- see the schema note above), filters to
+that subset, then runs both `acylate()` reactions on every remaining compound.
+Writes two tables
+under `output/` (a computed result, not input data): the mono-acylation
 products (one row per parent × reaction × reactive site, each with a real
 InChI/SMILES/formula/mass/adducts) and a formula-only table for compounds with
 more than one reactive site acylated at once (degree ≥ 2, no structure). Each
@@ -144,37 +181,58 @@ compound is processed inside a try/except so one bad structure can't abort
 the run; failures are counted and reported at the end.
 
 ```bash
-python build_suspect_library.py --limit 200          # quick test run first
-python build_suspect_library.py                      # full run
-python build_suspect_library.py --csv data/suspect_library.csv \
-    --csv-multidegree data/suspect_library_multidegree.csv   # also write plain CSVs
+python build_suspect_library.py --input data/unified_structures.parquet --limit 200  # quick test
+python build_suspect_library.py --input data/unified_structures.parquet              # full run
 ```
 
 ## `gui.py`
 
-Streamlit page: shows stats for the merged structure table and the suspect
-library built from it (row counts, fluoroacetyl/acetyl breakdown, a preview),
-plus a button to (re)build the suspect library from the merged table without
-leaving the GUI — this calls `build_suspect_library.build_library` directly
-(same code path as the CLI), with a real progress bar (not just a spinner)
-driven by the same per-checkpoint fraction `build_library` already computes
-for its text log.
+Streamlit page: turns a user-supplied library into the suspect library,
+**no longer specific to the DNP/LOTUS/HMDB merge** -- it reads whatever path
+was set on the Setup page (any CSV/Parquet), lets you map which column holds
+the structure (InChI/SMILES) and, optionally, name/organism, then runs two
+stages, each with a real progress bar:
+
+1. **Normalize** -- `db_loader.load_user_table` + `merge_rows` ->
+   `output/normalized_library.parquet`, with the same stats view the old
+   DNP/LOTUS/HMDB-specific page showed (unique structures, primary-amine
+   count, sources).
+2. **Build suspect library** -- `build_suspect_library.build_library` over
+   the normalized, primary-amine subset -> `output/suspect_library.parquet`
+   (+ multidegree), same as the CLI.
+
+Verified against a known-chemistry test set (4 compounds, one column-mapped
+CSV): normalize correctly flagged 3/4 as primary-amine-bearing (proline's
+secondary ring amine correctly excluded), and build correctly produced 4
+fluoroacetyl + 4 acetyl product rows (one simple amino acid's single site +
+a symmetric diamine's single *distinct* product despite two reactive ends +
+lysine's two independent alpha/epsilon sites).
 
 ## Folders
-- `data/` — all of this module's tables live here: the merged structure table
-  (`unified_structures.parquet` + a plain `.csv` copy) and the suspect library
-  built from it (`suspect_library.parquet` / `suspect_library_multidegree.parquet`
-  + plain `.csv` copies). This is **input data** for later steps (matching),
-  not a generated result. The raw source DBs (DNP/LOTUS/HMDB) live in a shared
-  parent data folder outside this repository, not here. All gitignored.
-- `output/` — reserved for genuine generated results (e.g. a final match
-  candidate table); empty for now.
+- `data/` — genuinely raw/example input only: the DNP+LOTUS+HMDB merge
+  (`unified_structures.parquet` + a plain `.csv` copy), produced by
+  `../../notebooks/build_unified_library.ipynb` (which calls `db_loader.py`'s
+  loaders), kept here as one example of "a library you already have" a user
+  could point the Setup page at. A plain structure table only -- no
+  `has_primary_amine`/`exact_mass` columns, same as any other input library.
+  The raw source DBs themselves live in a shared parent data folder outside
+  this repository, not here. All gitignored.
+- `output/` — every computed result: `normalized_library.parquet` (stage 1)
+  and `suspect_library.parquet`/`suspect_library_multidegree.parquet` (+ plain
+  `.csv` copies, stage 2). **Moved here 2026-08-02** from `data/` -- the
+  earlier "library files are input data" call was itself a mistake once the
+  library became something the *user* builds from their own raw file, rather
+  than something shipped with the repo; `suspect_library.parquet` in
+  particular is unambiguously computed output, same as a match's own
+  `candidate_table.parquet`.
 
 ## Status
-`db_loader.py`: built, tested, and run successfully across all three sources.
-`acylation.py` + `benchmark_aa.py`: built and tested, including the optional
-multi-site (formula-only) calculation. `build_suspect_library.py` + `gui.py`:
-built, tested, and run successfully over the full merged library.
+`db_loader.py`: built, tested, and run successfully across all three sources,
+plus the generic `load_user_table` path. `acylation.py` + `benchmark_aa.py`:
+built and tested, including the optional multi-site (formula-only)
+calculation. `build_suspect_library.py` + `gui.py`: built, tested, and run
+successfully both over the full DNP/LOTUS/HMDB merge and a small
+column-mapped user table.
 
 **Not yet built**: the actual matching step against real mzML data lives in
 the `comparison` module.

@@ -3,6 +3,408 @@
 Notable changes to this repository, newest first. Dated by when the change
 was committed (not necessarily the same day it's pushed).
 
+## 2026-08-03 — Fine-grained tolerances; Molecule Explorer's loader redesigned button-first
+
+MS Matching's MS2 precursor/ion tolerance and the acetyl co-occurrence
+tolerance/RT-window fields couldn't accept a value like 0.002 -- stuck at
+0.01 steps, since they were missing the explicit `format=` the main
+"Tolerance" field above them already had. All four now match that field's
+precision.
+
+Molecule Explorer's data-loading section (added earlier today) is now
+button-first rather than always showing full text/inputs: each of the three
+options is a single button with an automatically-computed status line right
+under it saying whether that action is possible right now, and why not if it
+isn't. The folder/file picker (previously always visible) is now hidden
+behind its own toggle button, only appearing once requested.
+
+## 2026-08-03 — Molecule Explorer can load its own data
+
+Molecule Explorer previously had no way to get data onto the page besides
+visiting MS Matching first (its auto-load populates the shared session state
+Molecule Explorer reads) -- opening it directly in a fresh session showed a
+dead end telling you to go run a match elsewhere. It now offers three ways to
+get data, without leaving the page: load the already-computed default result;
+point at any folder (offering a picker if it holds more than one saved filter
+variant) or a specific file; or, if a suspect library and mzML file selection
+already exist but no match has been run yet, run one directly.
+
+The match-running logic itself was extracted out of MS Matching's "Run
+match" button handler into a standalone function, reading its settings from
+persisted state rather than page-local widget variables -- both the button
+and Molecule Explorer's new "run whatever's missing" action call the same
+function, so they can't drift apart.
+
+## 2026-08-03 — Smoother progress bars; MS2 filter settings visible before running a match
+
+`load_user_table` (In-silico Library's Normalize step) and `build_library`
+(its Build step) used one `progress_every` value to drive both the
+console/status-text print *and* the GUI's progress-bar percentage, defaulting
+to 20,000 rows -- so the bar only moved every 20,000 rows, looking stalled in
+between on a large library. Decoupled the two: the console/status-text print
+interval is unchanged, but the progress-bar percentage now updates on its own,
+much finer cadence, scaled to the table's size (roughly 300 updates total,
+via a new `progress_fraction_every` parameter defaulting to `max(1, total //
+300)`) -- smooth on a small table, and not hundreds of thousands of individual
+bar-update calls on a huge one.
+
+MS Matching's MS2 diagnostic-ion filter had its checkbox in Optional filters
+(visible before running anything), but its actual settings -- precursor/RT/ion
+tolerance, and the "no active target" warning -- only rendered after a match
+result already existed, unlike the acetyl co-occurrence filter right above it,
+whose settings are visible immediately. Split the settings out into their own
+function, rendered right next to the checkbox, so they're visible and
+adjustable pre-run now too; only the actual "Run MS2 cross-check" button and
+its "missing column" check (which genuinely need a real result) still live
+post-run.
+
+## 2026-08-03 — Per-module run history (small CSV logs), replacing a slow live recount
+
+Added `common/run_log.py`: a small shared helper that appends one summary row
+(counts, timing, key parameters) to a plain CSV each time a pipeline action
+actually finishes (Normalize, Build suspect library, Run match, MS2
+cross-check), and renders that history as a table on the relevant page. Each
+action gets its own log file (its own natural set of columns) rather than one
+shared file.
+
+This also removes a live recomputation that used to run on every single page
+render of In-silico Library: how many normalized compounds have a reactive
+functional group. That count is now recorded once, in the Build step's own
+run history, generically labeled by whichever functional group that run
+actually targeted -- not hardcoded as a permanent "primary amine" fixture of
+the page (primary amine is currently the only implemented functional group,
+chosen as the easiest benchmark case; others are expected later).
+
+## 2026-08-03 — Code review pass: a real chemistry bug, a crash, several smaller fixes
+
+A systematic read-through of every module, prompted by several rounds of
+live-testing issues. Findings below, ordered roughly by severity.
+
+### Fixed -- chemistry correctness
+- `build_suspect_library.py` derived a compound's reactive-site count from
+  `len(products)` (the deduplicated mono-acylation product list), not the
+  actual number of reactive sites. For a symmetric multi-site molecule (two
+  equivalent amines), both sites yield an identical product after
+  deduplication, so the site count silently came out as 1 instead of 2 --
+  meaning the degree-2 (both-ends-acylated) row was never added to the
+  multidegree table for any symmetric multi-site compound in the library,
+  even though `multi_degree_formulas()` computes it correctly whenever it's
+  actually asked. Fixed to use `count_reactive_sites(mol)` directly.
+
+### Fixed -- crashes
+- MS Matching's "View a saved result from output/" crashed when loading any
+  of the three `candidate_features*` variants: they're already a final,
+  collapsed table and were stored directly as the page's "raw hits" table,
+  but the summary/structure-grid code unconditionally expects raw-hit-shaped
+  columns (`scan_index`, `product_smiles`, ...) that a collapsed features
+  table never had. Now shown with a plain message instead of crashing;
+  Molecule Explorer read the same session state and would have hit the
+  identical crash.
+- `mzml_tools/plotting.py`'s `save_xic_figure` crashed (`max()` on an empty
+  sequence) if requested against an MS level with zero matching scans in the
+  file. Guarded the same way its sibling function already guards the same
+  situation.
+
+### Fixed -- real, currently-masked bugs
+- Several `@st.cache_data`-wrapped functions (added across today and
+  earlier work) took their cache-busting mtime argument as `_mtime` --
+  Streamlit excludes any leading-underscore argument from the cache key
+  entirely, so a changed file would silently keep returning the *old*
+  cached result instead of recomputing. Currently masked wherever this
+  session's own code always calls `st.cache_data.clear()` right after
+  writing, but not if the underlying file changes from outside the app
+  (e.g. the merge notebook, a bare CLI run, or a file replaced while the app
+  is open). Renamed to `mtime` (no leading underscore) everywhere this
+  pattern appeared.
+- The "save once per fresh dataset, not on every rerun" fix from earlier
+  today (added to stop a large result table being rewritten to disk on
+  every single page interaction) had its own bug: the early return added to
+  skip a redundant disk write also skipped the download button/oversize
+  notice on every rerun after the first. Decoupled: the write still happens
+  at most once, but a working download control (or accurate size notice)
+  now shows on every render.
+- `build_suspect_library.py --limit` (documented as "for a quick test run")
+  ran the expensive per-row RDKit primary-amine/mass computation over the
+  *entire* input table before slicing to `--limit`, defeating its own
+  purpose on a real, large library. Reordered so the slice happens first.
+
+### Changed -- smaller fixes and cleanup
+- Two places read a shared/cross-page `session_state` key directly instead
+  of via `restore()` first, working today only because of the current call
+  order within their own function -- the same class of bug fixed several
+  times already today, hardened here before it recurs: `setup/gui.py`'s
+  status metrics, and the mzML Scan Detector's per-target "Explore" button
+  (read tolerance/unit/etc. before the page's own `restore()` calls for
+  them had run yet this render).
+- "Add target" (mzML Scan Detector) cleared the label field after adding
+  but not the m/z field, leaving a stale value for the next entry -- now
+  clears both.
+- A stray "bonus" description of the MS2 filter survived on the Setup
+  page's module list (missed in an earlier wording pass elsewhere).
+- Removed a couple of small dead-code/inefficiency items found during the
+  review: an unused return value in the mzML Scan Detector, a
+  `persist()` call that ran once per existing diagnostic target on every
+  render instead of once total, and a vestigial cleanup key in MS Matching
+  that named a file nothing actually writes.
+
+## 2026-08-03 — Fix two silent multi-minute slowdowns on every page rerun
+
+### Fixed
+- MS Matching re-saved the full raw-hit table (CSV *and* parquet, hundreds
+  of MB for a real result) to `output/` on *every* page rerun -- including
+  ones triggered by an unrelated interaction like toggling a checkbox -- not
+  only once when the result was actually new. This made the rest of the
+  page, and anything below the results table, visibly slow to appear after
+  any click, easily read as the page being stuck. Now saves each result
+  variant once per fresh dataset, tracked per file, not on every render.
+- In-silico Library recomputed `has_primary_amine` (RDKit, one substructure
+  match per row -- deliberately not stored as a column, see the schema note
+  in `db_loader.py`) from scratch on every page rerun to show a single
+  count metric. For a real library (hundreds of thousands of rows) this
+  alone took ~6 minutes (measured: 359s for 463,329 rows), with nothing
+  rendering below it and no visible feedback that anything was happening.
+  Cached per normalized file
+  (only reruns when the file actually changes) with a spinner shown while it
+  computes the one time it does; the equivalent step in "Build suspect
+  library" also now shows a spinner instead of no feedback at all.
+
+## 2026-08-03 — MS2 filter: drop "bonus" framing, keep its settings visible
+
+### Changed
+- Stopped calling the MS2 diagnostic-ion filter a "bonus" filter (in its
+  checkbox label, section heading, and docstrings/README) -- it's just
+  another filter, not an optional extra.
+- Its own settings (precursor/RT/ion tolerance) are no longer hidden when
+  there's currently no active diagnostic target or the loaded result
+  predates this filter -- those cases now show as plain warnings (with the
+  "Run MS2 cross-check" button disabled) while the settings themselves stay
+  visible, same as every other filter's settings once it's checked.
+
+## 2026-08-03 — Actually show "task finished" messages
+
+### Fixed
+- Normalize/Build (In-silico Library) called `st.rerun()` immediately after
+  `st.success(...)` -- the rerun discards that message before the browser
+  ever renders it, so the completion banner was never actually seen. Removed
+  the unnecessary rerun (the page already reflects the fresh result on the
+  same run without it).
+- Both `load_user_table` and `build_library` printed progress checkpoints
+  every N rows but never a final "done" line -- watching the console alone
+  gave no completion signal either. Both now print (and pass through their
+  text callback) an explicit final summary when finished.
+
+### Added
+- `common.ui.notify_done`/`render_last_notification`: a two-part completion
+  signal for every long-running action (Normalize, Build suspect library,
+  Run match, MS2 cross-check) -- an `st.toast` for an immediate, hard-to-miss
+  alert, plus a persistent success banner that (unlike a one-time message
+  inside a button's own `if` block) survives page reruns and stays visible
+  until that same action next completes, in case the toast itself is missed.
+
+## 2026-08-03 — Browse any saved MS Matching result from output/
+
+### Added
+- "View a saved result from output/": every filter combination MS Matching
+  can produce (raw hits, acetyl-co-occurring subset, collapsed features,
+  collapsed + acetyl-co-occurring, MS2-confident subset) is discovered
+  directly from what's actually present under `output/` and can be loaded
+  and viewed on demand, instead of only ever seeing the one most-recently-
+  computed result. A persistent "Currently viewing: ..." banner names
+  exactly which result (full/unfiltered, or which specific saved subset) is
+  on screen at all times.
+
+### Fixed
+- Every result table (raw hits, its acetyl-co-occurring subset, collapsed
+  features, its own acetyl-co-occurring subset) is now always saved to
+  `output/` the moment it's computed, not only when it happened to be too
+  large to offer as a direct in-browser download -- a smaller/more-filtered
+  result (e.g. after a stricter run) previously vanished the moment the
+  session ended, with nothing on disk to load back later.
+- Viewing a saved result variant no longer re-saves it under a different
+  file's canonical name (which would have silently overwritten that other
+  file's content, e.g. viewing the MS2-confident subset overwriting plain
+  `candidate_features.parquet`).
+
+## 2026-08-03 — MS2 confidence filter moved next to the other filters
+
+### Changed
+- The MS2 diagnostic-ion high-confidence filter is now a checkbox in
+  "Optional filters", same as acetyl co-occurrence and feature collapsing,
+  instead of its own separate section a user had to scroll past the whole
+  page (including the feature map) to find. Its results now render inline
+  right after the main summary, and the filter's own caption now states
+  explicitly that matching any one active diagnostic ion is enough for an
+  MS2 scan to count (a scan/feature-level OR across targets, not an AND).
+
+## 2026-08-02 — Real progress bar while normalizing a library
+
+### Added
+- "Normalize library" now shows an actual progress bar, not just a status
+  line -- a full real-world library (hundreds of thousands of rows) can take
+  tens of minutes to parse via RDKit, and with only a status line updating
+  every 20,000 rows it wasn't obvious the app was still working rather than
+  stuck. `load_user_table` gained a `progress_fraction_callback`, the same
+  pattern `build_library`'s progress bar already used.
+
+## 2026-08-02 — Accept InChI/SMILES independently; fix two persistence bugs
+
+### Changed
+- In-silico Library's column mapping no longer forces one combined
+  "structure column": map an InChI column, a SMILES column, or both
+  independently (either is sufficient on its own; if both are mapped, InChI
+  is tried first per row, falling back to SMILES only where the InChI value
+  is missing or unparseable). There's still no InChIKey column to map -- it's
+  a one-way hash with no structure to recover from it alone.
+- Removed the editable "Source label" field from that same page; the
+  `source_db` bookkeeping value is still recorded, just derived silently from
+  the file name instead of exposed as a control, since the app doesn't
+  actually support merging more than one normalized library in a single run
+  (the caption describing that use case was aspirational, not real).
+
+### Fixed
+- The mzML Scan Detector's diagnostic ion target list wasn't wired into the
+  settings-persistence system at all, so it never saved with a settings
+  preset regardless of which page was active. MS Matching's own read of that
+  list also needed a `restore()` first, same reasoning as other shared keys
+  -- reading it directly worked only while the Scan Detector page itself was
+  the one currently mounted.
+- Computing `has_primary_amine`/`exact_mass` from a stored InChI crashed if
+  that InChI failed to re-parse (an `AttributeError`, since RDKit returns
+  `None` rather than raising) or wasn't a string at all (a `NaN` value slips
+  past a bare truthiness check, since `NaN` is truthy in Python) -- both are
+  now treated as "no structure" instead of crashing.
+
+## 2026-08-02 — Merged structure table no longer bakes in computed columns
+
+### Changed
+- `db_loader.py`'s merged structure table (`inchi`/`inchikey`/`smiles`/
+  `formula`/`name`/`organism`/`source_db`) no longer includes
+  `has_primary_amine` or `exact_mass`. Neither is something any source
+  database actually supplies, and the project will classify reactive sites
+  beyond just primary amines over time -- that kind of task-specific
+  chemistry belongs downstream, not baked into a general-purpose merged
+  structure table. Both are computed fresh, right where they're needed
+  (`build_suspect_library.py`, the In-silico Library page's "Build" step),
+  via new `has_primary_amine`/`compute_primary_amine_flags`/
+  `compute_exact_mass_series` helpers.
+- The DNP/LOTUS/HMDB merge that produces `data/unified_structures.parquet`
+  now lives in `notebooks/build_unified_library.ipynb` (calling the same
+  `db_loader.py` loaders) instead of only being reachable via a bare CLI
+  call -- the merge process is now visible on GitHub with its real saved
+  output. The three source databases are outside the repository regardless,
+  so re-running it needs your own local copies; reading it doesn't.
+
+## 2026-08-02 — Guard the In-silico Library page against a bad column mapping
+
+### Fixed
+- Normalizing a library whose structure-column mapping pointed at something
+  unparseable (e.g. an InChIKey, which is a one-way hash) silently produced
+  an empty, columnless result file; opening the page again then crashed with
+  a raw `KeyError` instead of showing anything useful. A normalize run that
+  parses zero rows now shows a clear message instead of writing that file,
+  and the page also checks any already-written result for the columns it
+  expects, offering to delete a stale/broken one instead of crashing on it.
+- The structure-column mapping no longer defaults to blindly picking the
+  first column in the table -- it prefers an obviously-named one
+  (`inchi`/`smiles`/`structure`/`canonical_smiles`) when present, since a
+  table listing its hash column first was exactly how the above got
+  triggered in practice.
+
+## 2026-08-02 — Auto-load results; fix a real setting-sharing bug
+
+### Added
+- Setup page: optional paths to an already-built suspect library and an
+  already-saved MS Matching result, defaulting to each module's standard
+  output location. In-silico Library and MS Matching now auto-populate from
+  disk the moment you open them, instead of requiring a manual "load" click
+  every session.
+- mzML file discovery now looks under `<repo root>/data/mzml/` instead of a
+  path outside the repository -- a convention any clone can use.
+
+### Fixed
+- The Setup page's shared mzML selection silently dropped any file entered
+  as a custom path (rather than picked from the discovered-files list) --
+  it displayed correctly on the Setup page itself, but never reached any
+  other page's default selection. Every reader now goes through one
+  function that correctly combines both halves of that picker.
+- Loading a settings preset wiped out any setting the preset predated
+  (added since it was saved), instead of only touching the settings it
+  actually specifies.
+
+### Changed
+- Hid the top-right "running" indicator's icon (not configurable through
+  Streamlit itself); the "Stop" button next to it still works as before.
+
+## 2026-08-02 — Add a Setup page; accept any user-supplied library
+
+### Added
+- New Setup page (first in the sidebar): explains what each other page does,
+  and holds one shared mzML file selection + library file path that every
+  other page's own picker now seeds its default from -- pick files/a library
+  once, still change them per page if needed.
+- In-silico Library no longer requires the specific DNP/LOTUS/HMDB merge: it
+  reads whatever library file path is set on the Setup page (any CSV or
+  Parquet), lets you map which column holds each compound's structure
+  (InChI or SMILES) plus optional name/organism columns, and computes
+  everything else (formula, exact mass, InChIKey, whether a compound has a
+  primary amine) from that structure. `db_loader.py` gained
+  `load_user_table` for this; the existing DNP/LOTUS/HMDB-specific loaders
+  are unchanged.
+
+### Changed
+- The suspect library (and its new normalized-input intermediate) now write
+  to `output/`, not `data/` -- both are computed results, not input data;
+  only an example raw structure table stays in `data/`.
+- `common.ui.pick_mzml_files` gained a `default` parameter so a page's file
+  picker can start pre-selected from another page's choice without becoming
+  the same, always-in-sync widget.
+
+## 2026-07-31 — Add an MS2 diagnostic-ion high-confidence filter
+
+### Added
+- mzML Scan Detector: multiple files can now be picked at once, with a
+  selector for which one is currently active, plus a curated list of
+  diagnostic fragment-ion targets (add/remove, explore each one
+  individually, and mark whether it should be used downstream).
+- `comparison/ms2_confidence.py`: associates an MS Matching feature with a
+  supporting MS2 scan by precursor mass and RT proximity to the feature's
+  apex, then checks that scan's peaks against the diagnostic ion targets. A
+  new "MS2 diagnostic-ion high-confidence filter" section on the MS Matching
+  page runs this as a bonus, more-filtered view on top of the existing result.
+- `collapse_to_features` now also records each feature's observed mass at
+  its apex scan (needed for the precursor association above).
+
+## 2026-07-31 — Switch navigation, add settings persistence and presets
+
+### Changed
+- `main.py` navigation is now `st.navigation` (a sidebar page list) instead
+  of `st.tabs`: tabs executed every page's code on every single rerun no
+  matter which tab was visible, so a heavy page kept slowing down clicks
+  made entirely on a different, unrelated page. Only the active page's code
+  runs now.
+
+### Added
+- `common/ui.py`: `restore`/`persist`, a small pattern every module's
+  filters and selections now use so they survive switching pages (the
+  navigation change above otherwise clears a widget's value whenever its
+  page is unmounted).
+- A "save/load a settings preset" control (sidebar): the current values of
+  every persisted setting, across every module, can be saved to and loaded
+  from a named local file.
+- MS Matching: a "load previously processed data" option that reads a
+  previously saved result straight from disk instead of re-running the
+  matching pipeline.
+
+## 2026-07-31 — Fix Molecule Explorer pagination
+
+### Fixed
+- "Load more" in the Molecule Explorer appeared to do nothing. The result
+  table it reads was being recomputed into a new object on every rerun
+  (not just when a match actually ran), which made the gallery's pagination
+  cache think the data had changed and reset back to the first page on every
+  interaction, including the one caused by the "Load more" click itself. The
+  result is now only recomputed when a match completes.
+
 ## 2026-07-27 — Speed up the Molecule Explorer
 
 ### Fixed

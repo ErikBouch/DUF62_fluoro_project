@@ -15,33 +15,51 @@ navigation/layout. Each downstream module lives in its own folder with:
   biggest ones (3000+ lines) hard to work with;
 - local `data/` and `output/` subfolders (gitignored).
 
-`main.py` imports each module's `gui.render()` and shows every module inside
-its own tab — one running app, not the old one-window-per-step/subprocess
-model. Tabs (not a sidebar radio) specifically because Streamlit keeps every
-tab's contents mounted and its widget state intact regardless of which one is
-currently visible — switching tabs is a client-side toggle, not a script
-rerun, so settings in one module are never lost by looking at another.
+`main.py` uses `st.navigation` (a sidebar page list) to show one module at a
+time — one running app, not the old one-window-per-step/subprocess model.
+`st.navigation` only runs the current page's code, unlike `st.tabs` (tried
+first), which re-executed every tab's code on every single rerun no matter
+which tab was visible — a real cost once any one page has heavy content.
+The tradeoff: a page's widgets lose their values when its page is unmounted.
+Every module works around that with `common.ui.restore`/`persist`, which
+mirror a widget's value into a plain session_state entry that navigation
+does *not* clear — so filters and selections still survive switching pages.
+That same store backs a "save/load a settings preset" control (sidebar):
+the whole app's current settings can be saved to and loaded from a named
+local file under `configs/` (gitignored).
+
+**`setup/` is the landing page** (first in the nav): explains what each other
+page does, and holds the one shared mzML file selection + library file path
+every other page seeds its own picker's default from
+(`common.ui.SHARED_MZML_KEY`/`SHARED_LIBRARY_PATH_KEY`) -- pick files/a
+library once there, and mzML Scan Detector/MS Matching/In-silico Library all
+start from the same place, while still letting each page diverge from it
+independently.
 
 ```
 scripts/
-├── main.py                 # Streamlit entry: tab nav, calls each module's gui.render()
+├── main.py                 # Streamlit entry: st.navigation, calls each module's gui.render()
 ├── common/
-│   └── ui.py                #   shared GUI helpers (file discovery, page header) — no science logic
+│   └── ui.py                #   shared GUI helpers (file discovery, page header, settings
+│   │                              persistence/presets) — no science logic
+├── setup/                   # landing page: module map + shared mzML/library selection
 ├── mzml_tools/              # open/read/query mzML files
 │   ├── scan_detector.py     #   logic: find scans with a target m/z, file overview; export CSV
 │   ├── gui.py                #   Streamlit page for the above
 │   ├── data/                 #   input mzML (gitignored)
 │   └── output/               #   CSV exports (gitignored, auto-created)
-├── insilico_library/        # merge NP databases + acylation logic; build/inspect the suspect library (CLI + GUI)
+├── insilico_library/        # turn a user-supplied library (column-mapped) into the suspect library (CLI + GUI)
 ├── comparison/               # match the suspect library against one or more mzML files (CLI + GUI)
 └── explorer/                 # gallery view of a match's compound structures (sort, paginate, isomer drill-down)
 ```
 
 Each module's `data/`/`output/` are gitignored; `output/` is auto-created at
-runtime. The real project mzML data lives outside the repo, in the parent
-`DUF_62/data/HRMS/` — `common/ui.py` looks there for files to list in the GUI's
-file picker (falls back to manual path entry if that folder isn't present,
-e.g. on a colleague's clone without the private data).
+runtime. **mzML files go in `<repo root>/data/mzml/`** (also gitignored) --
+a real, repo-relative convention any clone can use, not a path that only
+makes sense on one specific machine. `common/ui.py` looks there for files to
+list in the GUI's file picker, and falls back to manual path entry if it's
+empty or missing (e.g. a fresh clone before you've added your own data, or
+before running anything at all).
 
 ## Running the GUI
 
@@ -55,13 +73,13 @@ directory, not the script's location.)
 ## Running a module's logic directly (CLI / no GUI)
 
 ```bash
-python scripts/mzml_tools/scan_detector.py <file.mzML> --overview
-python scripts/mzml_tools/scan_detector.py <file.mzML> --mz 150.0 --tol 25 --unit ppm --min-rel-intensity 0.02 --ms-level 2
+python mzml_tools/scan_detector.py <file.mzML> --overview
+python mzml_tools/scan_detector.py <file.mzML> --mz 150.0 --tol 25 --unit ppm --min-rel-intensity 0.02 --ms-level 2
 
-python scripts/insilico_library/db_loader.py --dnp <dnp.tsv> --lotus <lotus.sdf> --hmdb <hmdb.xml> -o data/unified_structures.parquet
-python scripts/insilico_library/build_suspect_library.py --limit 200   # quick test run first
+python insilico_library/db_loader.py --dnp <dnp.tsv> --lotus <lotus.sdf> --hmdb <hmdb.xml> -o data/unified_structures.parquet
+python insilico_library/build_suspect_library.py --input data/unified_structures.parquet --limit 200   # quick test run first
 
-python scripts/comparison/run_match.py --limit 2000   # quick test run first
+python comparison/run_match.py --limit 2000   # quick test run first
 ```
 See each module's own README for details.
 

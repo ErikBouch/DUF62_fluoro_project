@@ -49,6 +49,13 @@ streamlit run scripts/main.py
 See `scripts/README.md` for the module architecture and running individual
 modules from the CLI without the GUI.
 
+## Your own data
+
+Put mzML files under `data/mzml/` (gitignored, created on demand) and the
+GUI's file pickers will discover them automatically; a library of candidate
+compounds (any CSV/Parquet with a structure column) can point anywhere --
+see the app's Setup page.
+
 ## Citation
 
 _To be added._
