@@ -15,18 +15,76 @@ navigation/layout. Each downstream module lives in its own folder with:
   biggest ones (3000+ lines) hard to work with;
 - local `data/` and `output/` subfolders (gitignored).
 
-`main.py` uses `st.navigation` (a sidebar page list) to show one module at a
-time — one running app, not the old one-window-per-step/subprocess model.
-`st.navigation` only runs the current page's code, unlike `st.tabs` (tried
-first), which re-executed every tab's code on every single rerun no matter
-which tab was visible — a real cost once any one page has heavy content.
-The tradeoff: a page's widgets lose their values when its page is unmounted.
-Every module works around that with `common.ui.restore`/`persist`, which
-mirror a widget's value into a plain session_state entry that navigation
-does *not* clear — so filters and selections still survive switching pages.
-That same store backs a "save/load a settings preset" control (sidebar):
-the whole app's current settings can be saved to and loaded from a named
-local file under `configs/` (gitignored).
+**Navigation is a hand-rolled top nav bar, not `st.navigation`** (switched in
+the visual redesign; `st.navigation`'s own sidebar page list is gone).
+`main.py` holds `st.session_state["page"]` and dispatches to exactly one
+module's `render()` via a plain if/elif-equivalent lookup (`PAGE_RENDERERS`)
+— the same real property `st.navigation` was originally chosen for over
+`st.tabs` (only the active page's code runs; the other four never execute
+that rerun) still holds, it's just achieved by a lookup table instead of a
+Streamlit-native API. The switch was needed because the new top nav +
+pipeline stepper (below) needed full layout control `st.navigation`'s fixed
+sidebar-list UI couldn't offer, not because the old mechanism was broken.
+
+The tradeoff `st.navigation` had — a page's widgets lose their values the
+moment its page stops being the active one — still applies, just for a more
+general reason: **any** Streamlit script drops a widget's session_state the
+moment a rerun doesn't re-instantiate it, regardless of *why* that page
+didn't render (page unmounted by `st.navigation`, or simply a different
+`if` branch taken this run, as here). Every module still works around this
+with `common.ui.restore`/`persist`, which mirror a widget's value into a
+plain session_state entry that survives regardless — so filters and
+selections still survive switching pages. That same store backs a
+"save/load a settings preset" control (sidebar, still used for this one
+utility, not for page switching anymore): the whole app's current settings
+can be saved to and loaded from a named local file under `configs/`
+(gitignored).
+
+**A 7-stage pipeline stepper** sits under the top nav on every page, showing
+at a glance which of the seven pipeline stages (acquire mzML data, link a
+library, normalize it, build the suspect library, calibrate MS Matching,
+run the match, review the output) are done, still to-do, or failed — each
+stage is a real, always-clickable button that jumps straight to the page
+that stage lives on. Its colors/glyph (yellow circle = to-do, green check =
+done, red cross = failed) come from each module's own small, pure status
+function (e.g. `setup.gui.acquire_data_status`, `comparison.gui.calibrate_status`)
+— `main.py` only assembles the 7-entry dict from those, it never computes
+pipeline status itself. The stepper's own render is deliberately *deferred*
+until after the current page's `render()` has already run (filled into a
+`st.container()` reserved before dispatch) — computing and rendering it
+*before* dispatch, as an earlier version briefly did, only self-corrected
+because every action handler happened to call `st.rerun()` afterward, which
+is a convention, not a guarantee; deferring the render removes the
+dependency on that convention entirely.
+
+**Every page (except Setup and Molecule Explorer) is built from bordered
+"sheets"** — LOAD / PARAMETERS / RUN / ANALYZE, in that order, each a plain
+`st.container(key="sheet_<name>")` — a shared CSS layer in `common/ui.py`
+turns that key into a bordered panel with a "SHEET N — TITLE" tab, purely
+via a static `SHEET_TITLES` registry and generated CSS, no per-page styling
+code needed. A rarely-touched settings group (e.g. an "Advanced" section)
+is a native `st.expander(..., key="flap_amber_...")` or
+`key="flap_ink_..."` — restyled by that same CSS layer into an amber
+("optional, safe to skip") or neutral-ink ("a primary feature, just
+collapsed") flap, with zero change to the expander's own contents. A
+4-mode color palette (blue/green/white/black, top-left "INK" selector) and a
+one-time-per-session boot animation round out the shared visual system —
+all in `common/ui.py`, ported from a separate Streamlit design-exploration
+round (13 mockups, narrowed and refined twice) that lives outside this
+repository.
+
+**A real gotcha worth knowing before touching `common/ui.py`'s `STATIC_CSS`
+or any of the `build_*_css` functions**: `st.html()` sanitizes its *entire*
+input as HTML before any of it is treated as inert CSS text — a single
+tag-shaped substring anywhere in that multi-thousand-character string, even
+inside what looks to a human like an ordinary CSS comment, silently drops
+the whole combined stylesheet with no exception and nothing in any log.
+This happened for real during the redesign (a comment describing what
+`st.expander` renders internally, phrased with literal angle brackets) and
+took real effort to isolate, since every other symptom looked like a
+routine widget-rendering issue rather than a poisoned style string. Never
+write a literal `<tag>`-shaped sequence anywhere in that combined string,
+comments included.
 
 **`setup/` is the landing page** (first in the nav): explains what each other
 page does, and holds the one shared mzML file selection + library file path
@@ -38,10 +96,10 @@ independently.
 
 ```
 scripts/
-├── main.py                 # Streamlit entry: st.navigation, calls each module's gui.render()
+├── main.py                 # Streamlit entry: top nav + pipeline stepper, dispatches to one module's gui.render()
 ├── common/
 │   └── ui.py                #   shared GUI helpers (file discovery, page header, settings
-│   │                              persistence/presets) — no science logic
+│   │                              persistence/presets, palette/boot/sheet/stepper CSS) — no science logic
 ├── setup/                   # landing page: module map + shared mzML/library selection
 ├── mzml_tools/              # open/read/query mzML files
 │   ├── scan_detector.py     #   logic: find scans with a target m/z, file overview; export CSV

@@ -13,7 +13,8 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.ui import (  # noqa: E402
-    page_header, persist, pick_mzml_files, resolved_shared_mzml_files, restore, status_button,
+    awaiting_input, mount_key, page_header, persist, pick_mzml_files,
+    resolved_shared_mzml_files, restore, status_button,
 )
 from mzml_tools.scan_detector import (  # noqa: E402
     extract_ion_chromatogram,
@@ -85,7 +86,10 @@ def _render_diagnostic_targets(active_path: str, active_mtime: float):
         st.session_state["new_target_label"] = ""
         st.session_state["new_target_mz"] = 0.0
 
-    with st.expander(f"Diagnostic ion targets ({len(targets)})", expanded=bool(targets)):
+    with st.expander(
+        f"Diagnostic ion targets ({len(targets)})", expanded=bool(targets),
+        key="flap_ink_diagnostic_targets",
+    ):
         st.caption(
             "Candidate fragment-ion m/z values to check for in MS2 spectra. Explore one "
             "against the currently active file above, then check \"use in filter\" to "
@@ -143,8 +147,29 @@ def render():
         "Find scans containing a target m/z (within tolerance, above an intensity filter) and export them to CSV.",
     )
 
-    _, path = _pick_files()
-    ready = bool(path and os.path.isfile(path))
+    with st.container(key="sheet_scan_load"):
+        _, path = _pick_files()
+        ready = bool(path and os.path.isfile(path))
+        mtime = os.path.getmtime(path) if ready else None
+
+        if ready:
+            with st.spinner("Reading file overview..."):
+                overview = _cached_overview(path, mtime)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Spectra", overview.n_spectra)
+            c2.metric("Polarity", "/".join(overview.polarity_counts))
+            c3.metric(
+                "RT range",
+                f"{overview.rt_range_minutes[0]:.1f}-{overview.rt_range_minutes[1]:.1f} min",
+            )
+            st.caption("MS levels: " + ", ".join(f"MS{k}: {v} scans" for k, v in sorted(overview.ms_level_counts.items())))
+            for lvl, (lo, hi) in sorted(overview.mz_range_by_level.items()):
+                st.caption(f"MS{lvl} observed m/z range: {lo:.3f} - {hi:.3f}")
+            st.caption(
+                "On some instruments/methods, the MS1 scan range doesn't extend down to very "
+                "low m/z, so small fragment ions may only be observable as MS2 product ions."
+            )
 
     # Restored here, before anything below reads these keys -- including
     # `_render_diagnostic_targets`'s "Explore" button, which reuses whatever
@@ -167,145 +192,128 @@ def render():
     restore("scan_min_rel", 2)
     restore("scan_threshold", 0.0)
 
-    if ready:
-        mtime = os.path.getmtime(path)
-        with st.spinner("Reading file overview..."):
-            overview = _cached_overview(path, mtime)
-
-        with st.expander("File overview", expanded=True):
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Spectra", overview.n_spectra)
-            c2.metric("Polarity", "/".join(overview.polarity_counts))
-            c3.metric(
-                "RT range",
-                f"{overview.rt_range_minutes[0]:.1f}-{overview.rt_range_minutes[1]:.1f} min",
-            )
-            st.caption("MS levels: " + ", ".join(f"MS{k}: {v} scans" for k, v in sorted(overview.ms_level_counts.items())))
-            for lvl, (lo, hi) in sorted(overview.mz_range_by_level.items()):
-                st.caption(f"MS{lvl} observed m/z range: {lo:.3f} - {hi:.3f}")
-            st.caption(
-                "On some instruments/methods, the MS1 scan range doesn't extend down to very "
-                "low m/z, so small fragment ions may only be observable as MS2 product ions."
-            )
-
-        _render_diagnostic_targets(path, mtime)
-
-    col1, col2, col3 = st.columns(3)
-    target_mz = col1.number_input("Target m/z", format="%.4f", key="scan_target_mz")
-    tolerance = col2.number_input(
-        "Tolerance", min_value=0.1, key="scan_tolerance",
-        help="How far a scan's peak m/z may be from the target and still count as a match. "
-             "ppm scales with mass (wider window for a heavier ion); Da is a fixed window at "
-             "every mass.",
-    )
-    unit = col3.selectbox("Unit", ["ppm", "Da"], key="scan_unit")
-    persist("scan_target_mz")
-    persist("scan_tolerance")
-    persist("scan_unit")
-
-    col4, col5 = st.columns(2)
-    ms_level_choice = col4.selectbox(
-        "MS level", ["All", "1", "2"], key="scan_ms_level",
-        help="MS1 = the instrument's regular full-scan spectra (an intact compound's own mass). "
-             "MS2 = fragment spectra recorded after selecting one precursor mass -- only "
-             "meaningful for a target that's actually a fragment ion, not a whole molecule.",
-    )
-    ms_level = None if ms_level_choice == "All" else int(ms_level_choice)
-    min_rel_pct = col5.slider(
-        "Min. relative intensity (% of that scan's base peak)", 0, 100, key="scan_min_rel",
-        help="Relative to each scan's own tallest peak, not one global maximum across the whole "
-             "file -- the same absolute intensity can pass in a quiet scan and fail in a busy one.",
-    )
-    min_rel = min_rel_pct / 100.0
-    persist("scan_ms_level")
-    persist("scan_min_rel")
-
-    with st.expander("Advanced"):
-        threshold = st.number_input(
-            "Min. absolute intensity (0 = off)", min_value=0.0, key="scan_threshold",
-            help="Raw instrument units, applied in addition to the relative-intensity filter "
-                 "above -- a peak below this never counts as a hit, however high its relative "
-                 "intensity is; 0 disables it.",
+    with st.container(key="sheet_scan_params"):
+        col1, col2, col3 = st.columns(3)
+        target_mz = col1.number_input("Target m/z", format="%.4f", key="scan_target_mz")
+        tolerance = col2.number_input(
+            "Tolerance", min_value=0.1, key="scan_tolerance",
+            help="How far a scan's peak m/z may be from the target and still count as a match. "
+                 "ppm scales with mass (wider window for a heavier ion); Da is a fixed window at "
+                 "every mass.",
         )
-        persist("scan_threshold")
+        unit = col3.selectbox("Unit", ["ppm", "Da"], key="scan_unit")
+        persist("scan_target_mz")
+        persist("scan_tolerance")
+        persist("scan_unit")
 
-    status = (
-        "Possible -- ready to search." if ready
-        else "Not possible yet -- pick or enter an mzML file above."
-    )
-    if status_button("Find scans", "scan_btn_find", ready, status):
-        with st.spinner("Searching spectra..."):
-            matches = _cached_search(
-                path, os.path.getmtime(path), target_mz, tolerance, unit, threshold, min_rel, ms_level,
+        col4, col5 = st.columns(2)
+        ms_level_choice = col4.selectbox(
+            "MS level", ["All", "1", "2"], key="scan_ms_level",
+            help="MS1 = the instrument's regular full-scan spectra (an intact compound's own mass). "
+                 "MS2 = fragment spectra recorded after selecting one precursor mass -- only "
+                 "meaningful for a target that's actually a fragment ion, not a whole molecule.",
+        )
+        ms_level = None if ms_level_choice == "All" else int(ms_level_choice)
+        min_rel_pct = col5.slider(
+            "Min. relative intensity (% of that scan's base peak)", 0, 100, key="scan_min_rel",
+            help="Relative to each scan's own tallest peak, not one global maximum across the whole "
+                 "file -- the same absolute intensity can pass in a quiet scan and fail in a busy one.",
+        )
+        min_rel = min_rel_pct / 100.0
+        persist("scan_ms_level")
+        persist("scan_min_rel")
+
+        if ready:
+            _render_diagnostic_targets(path, mtime)
+
+        with st.expander("Advanced", key="flap_amber_scan_advanced"):
+            threshold = st.number_input(
+                "Min. absolute intensity (0 = off)", min_value=0.0, key="scan_threshold",
+                help="Raw instrument units, applied in addition to the relative-intensity filter "
+                     "above -- a peak below this never counts as a hit, however high its relative "
+                     "intensity is; 0 disables it.",
             )
-        st.session_state["scan_matches"] = matches
-        st.session_state["scan_matches_mz"] = target_mz
+            persist("scan_threshold")
 
-    if not ready:
-        return
+    with st.container(key="sheet_scan_run"):
+        status = (
+            "Possible -- ready to search." if ready
+            else "Not possible yet -- pick or enter an mzML file above."
+        )
+        if status_button("Find scans", "scan_btn_find", ready, status):
+            with st.spinner("Searching spectra..."):
+                matches = _cached_search(
+                    path, os.path.getmtime(path), target_mz, tolerance, unit, threshold, min_rel, ms_level,
+                )
+            st.session_state["scan_matches"] = matches
+            st.session_state["scan_matches_mz"] = target_mz
 
     matches = st.session_state.get("scan_matches")
-    if matches is None:
-        return
-
-    import pandas as pd
-
-    df = pd.DataFrame([m.__dict__ for m in matches])
-    st.divider()
-
-    if df.empty:
-        st.warning("No matching scans found with these settings.")
-        return
-
-    n_distinct_precursors = df["precursor_mz"].dropna().round(2).nunique() if "precursor_mz" in df else 0
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Matching scans", len(df))
-    c2.metric("Distinct precursor masses", n_distinct_precursors)
-    c3.metric("Max relative intensity", f"{df['relative_intensity'].max():.0%}")
-
-    st.dataframe(df.sort_values("intensity", ascending=False), width="stretch")
-
-    st.download_button(
-        "Download CSV",
-        df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{os.path.splitext(os.path.basename(path))[0]}_mz{st.session_state['scan_matches_mz']:g}.csv",
-        mime="text/csv",
+    analyze_key = (
+        mount_key("sheet_scan_analyze", "scan_analyze_entered")
+        if matches is not None else "sheet_scan_analyze"
     )
+    with st.container(key=analyze_key):
+        if matches is None:
+            awaiting_input("Run Find scans above to see results.", key="await_scan_analyze")
+        else:
+            import pandas as pd
 
-    try:
-        import plotly.express as px
+            df = pd.DataFrame([m.__dict__ for m in matches])
+            st.divider()
 
-        fig = px.scatter(
-            df, x="rt_minutes", y="relative_intensity",
-            size="intensity", color="ms_level",
-            hover_data=["matched_mz", "precursor_mz", "native_id"],
-            labels={"rt_minutes": "RT (min)", "relative_intensity": "Relative intensity"},
-        )
-        st.plotly_chart(fig, width="stretch")
-    except ImportError:
-        st.caption("(install `plotly` for an interactive RT/intensity plot)")
+            if df.empty:
+                st.warning("No matching scans found with these settings.")
+            else:
+                n_distinct_precursors = df["precursor_mz"].dropna().round(2).nunique() if "precursor_mz" in df else 0
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Matching scans", len(df))
+                c2.metric("Distinct precursor masses", n_distinct_precursors)
+                c3.metric("Max relative intensity", f"{df['relative_intensity'].max():.0%}")
 
-    st.divider()
-    st.subheader("Extracted ion chromatogram (XIC)")
-    st.caption(
-        "A continuous intensity-vs-RT trace for the target m/z (every scan, not just "
-        "above-threshold hits) -- the standard way to see whether there's a real "
-        "chromatographic peak. Most meaningful at MS1 for an intact compound's own mass; "
-        "MS2 fragment traces are noisier since many precursors share scan cycles."
-    )
-    restore("xic_ms_level", "1", valid_options=["1", "2"])
-    xic_ms_level = st.selectbox("XIC MS level", ["1", "2"], key="xic_ms_level")
-    persist("xic_ms_level")
-    if st.button("Compute XIC"):
-        with st.spinner("Building chromatogram..."):
-            points = extract_ion_chromatogram(path, target_mz, tolerance, unit, int(xic_ms_level))
-        import plotly.graph_objects as go
+                st.dataframe(df.sort_values("intensity", ascending=False), width="stretch")
 
-        rt = [p.rt_minutes for p in points]
-        inten = [p.intensity for p in points]
-        fig = go.Figure(go.Scatter(x=rt, y=inten, mode="lines", fill="tozeroy", line=dict(color="#2dd4bf")))
-        fig.update_layout(xaxis_title="RT (min)", yaxis_title="Intensity")
-        st.plotly_chart(fig, width="stretch")
-        if inten:
-            apex = max(points, key=lambda p: p.intensity)
-            st.caption(f"Apex: RT {apex.rt_minutes:.2f} min, intensity {apex.intensity:.3e}")
+                st.download_button(
+                    "Download CSV",
+                    df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{os.path.splitext(os.path.basename(path))[0]}_mz{st.session_state['scan_matches_mz']:g}.csv",
+                    mime="text/csv",
+                )
+
+                try:
+                    import plotly.express as px
+
+                    fig = px.scatter(
+                        df, x="rt_minutes", y="relative_intensity",
+                        size="intensity", color="ms_level",
+                        hover_data=["matched_mz", "precursor_mz", "native_id"],
+                        labels={"rt_minutes": "RT (min)", "relative_intensity": "Relative intensity"},
+                    )
+                    st.plotly_chart(fig, width="stretch")
+                except ImportError:
+                    st.caption("(install `plotly` for an interactive RT/intensity plot)")
+
+                st.divider()
+                st.subheader("Extracted ion chromatogram (XIC)")
+                st.caption(
+                    "A continuous intensity-vs-RT trace for the target m/z (every scan, not just "
+                    "above-threshold hits) -- the standard way to see whether there's a real "
+                    "chromatographic peak. Most meaningful at MS1 for an intact compound's own mass; "
+                    "MS2 fragment traces are noisier since many precursors share scan cycles."
+                )
+                restore("xic_ms_level", "1", valid_options=["1", "2"])
+                xic_ms_level = st.selectbox("XIC MS level", ["1", "2"], key="xic_ms_level")
+                persist("xic_ms_level")
+                if st.button("Compute XIC"):
+                    with st.spinner("Building chromatogram..."):
+                        points = extract_ion_chromatogram(path, target_mz, tolerance, unit, int(xic_ms_level))
+                    import plotly.graph_objects as go
+
+                    rt = [p.rt_minutes for p in points]
+                    inten = [p.intensity for p in points]
+                    fig = go.Figure(go.Scatter(x=rt, y=inten, mode="lines", fill="tozeroy", line=dict(color="#2dd4bf")))
+                    fig.update_layout(xaxis_title="RT (min)", yaxis_title="Intensity")
+                    st.plotly_chart(fig, width="stretch")
+                    if inten:
+                        apex = max(points, key=lambda p: p.intensity)
+                        st.caption(f"Apex: RT {apex.rt_minutes:.2f} min, intensity {apex.intensity:.3e}")

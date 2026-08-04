@@ -3,6 +3,71 @@
 Notable changes to this repository, newest first. Dated by when the change
 was committed (not necessarily the same day it's pushed).
 
+## 2026-08-05 — Visual redesign: top nav, a real pipeline stepper, sheet-based pages
+
+### Changed
+- `main.py` no longer uses `st.navigation`. Navigation is now a hand-rolled
+  top nav bar plus `st.session_state["page"]` dispatch to exactly one
+  module's `render()` per rerun -- the same "only the active page's code
+  runs" property `st.navigation` was chosen for still holds, achieved by a
+  lookup table instead of a Streamlit-native API, needed because the new
+  top nav + stepper wanted layout control `st.navigation`'s fixed sidebar
+  page list didn't offer. `common.ui.restore`/`persist` are unchanged --
+  the underlying Streamlit behavior they work around (a widget's
+  session_state is dropped the moment a rerun doesn't re-instantiate it)
+  is general, not specific to how a page failed to render this rerun.
+- Every page except Setup and Molecule Explorer is now built from bordered
+  "sheets" (LOAD / PARAMETERS / RUN / ANALYZE), a shared `common.ui`
+  container-key convention with generated CSS, not per-page styling code.
+  A rarely-touched settings group is now a native `st.expander(key=...)`
+  restyled into an amber ("optional") or neutral-ink ("primary, just
+  collapsed") flap, instead of the plain unstyled expander it used to be --
+  zero change to any expander's actual contents.
+- Added a 4-mode color palette (blue/green/white/black, a top-left "INK"
+  selector) and a one-time-per-session boot animation, both shared across
+  every page via `common/ui.py`.
+
+### Added
+- A 7-stage pipeline stepper under the top nav on every page (acquire mzML
+  data, link a library, normalize it, build the suspect library, calibrate
+  MS Matching, run the match, review the output), each stage a real,
+  always-clickable button showing to-do/done/failed at a glance and jumping
+  straight to that stage's page. Each module now exposes small, pure status
+  functions for the stages it owns (e.g. `setup.gui.acquire_data_status`,
+  `comparison.gui.calibrate_status`) -- `main.py` only assembles the 7-entry
+  dict from those, never computing pipeline status itself. The stepper's
+  own render is deferred until after the current page's `render()` has run,
+  so a just-completed action reflects immediately rather than depending on
+  every action handler remembering to call `st.rerun()`.
+- MS Matching: a new "Lock Calibration" control (PARAMETERS sheet) --
+  snapshots every current match/MS2 setting when clicked, including the
+  diagnostic-ion targets curated on a different page, and auto-clears
+  itself the moment any of them change afterward. Exists to give the
+  stepper's "calibrate" stage an honest, non-fakeable completion signal;
+  gives the app a genuine settings-review gate as a side effect.
+- Normalize's fresh-run-parsed-0-rows failure and Molecule Explorer's
+  reached-with-no-structures case now both set a session flag the stepper
+  can read (previously only ever shown as an on-screen `st.error`/
+  `st.warning`, invisible to anything reading state from elsewhere).
+  Explorer's flags reset via `comparison.gui`'s `_populate_result_session_state`
+  whenever genuinely new data loads, so a stale "already reviewed" signal
+  can't survive onto an unreviewed result.
+
+### Fixed
+- Root and `mzml_tools/README.md` both still described the mzML file
+  picker as auto-discovering files under a sibling `data/mzml/` -- dropped
+  in favor of manual path entry several changes ago (see 2026-08-04
+  below), but the docs never caught up. Corrected; `find_mzml_files`/
+  `DEFAULT_HRMS_DIR` still exist for the CLI scripts that use them directly.
+- A real, non-obvious `st.html()` gotcha, found while building the above:
+  it sanitizes its *entire* input as HTML before any of it is treated as
+  inert CSS text, so a single tag-shaped substring anywhere in a large
+  combined stylesheet string -- even inside what reads to a human as an
+  ordinary comment -- silently drops the whole thing, no exception, nothing
+  in any log. Cost real time to isolate (every symptom looked like a
+  routine rendering bug); documented directly in `common/ui.py` so it
+  doesn't recur.
+
 ## 2026-08-04 — mzML Scan Detector gets a status button; simpler file picker; In-silico Library split into two workflows
 
 Sidebar width range narrowed to 10%-20% of screen width (was 14%-32%).

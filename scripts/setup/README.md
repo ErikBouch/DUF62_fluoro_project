@@ -1,6 +1,6 @@
 # setup
 
-The app's landing page (first in the sidebar nav). No science logic of its
+The app's landing page (first in the top nav). No science logic of its
 own -- purely orientation and shared selection.
 
 ## `gui.py`
@@ -31,8 +31,14 @@ Four things:
    Matching read these to auto-populate from disk the moment you open them
    -- no "load" click needed every session, so opening each module
    automatically shows the results already created.
-5. **Status** -- mzML files selected, and whether a suspect library / MS
-   Matching result is ready to auto-load.
+5. **Status** -- a 7-row ledger, one row per pipeline stage (same seven
+   stages, same to-do/done/failed states and colors as the stepper strip
+   under the top nav on every page), pulling each stage's live status from
+   the module that owns it (`acquire_data_status`/`link_library_status` are
+   this page's own two new functions; the other five are read from
+   `insilico_library.gui`/`comparison.gui`/`explorer.gui`). Superseded the
+   previous three-metric summary (files selected / library ready / result
+   ready), which only ever covered 3 of these 7 stages.
 
 ## Shared-key pitfalls found while building this (both fixed)
 
@@ -40,11 +46,14 @@ Four things:
 `SHARED_LIBRARY_PATH_KEY`/`SHARED_SUSPECT_LIBRARY_KEY`/`SHARED_CANDIDATE_TABLE_KEY`
 without also rendering that exact widget itself must call
 `common.ui.restore(key, default)` first -- these are widget keys *on this
-page*, so `st.navigation` clears their own session_state entry the moment
-this page is unmounted, same as any other widget. Reading them directly from
-`st.session_state` works fine while Setup itself is the active page, then
-silently returns nothing from any other page until `restore()` pulls the
-persisted value back in.
+page*, and Streamlit clears a widget's own session_state entry the moment a
+rerun doesn't re-instantiate it, whatever the reason (this used to be
+`st.navigation` unmounting the page; after the switch to a hand-rolled top
+nav it's simply that a different `if`/dispatch branch ran this rerun --
+same underlying Streamlit behavior either way, same fix needed). Reading
+them directly from `st.session_state` works fine while Setup itself is the
+active page, then silently returns nothing from any other page until
+`restore()` pulls the persisted value back in.
 
 **The mzML list used to be two widgets, not one -- reading only the
 multiselect's own session_state silently dropped anything entered as a

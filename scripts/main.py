@@ -1,26 +1,36 @@
 """
 main.py — DUF62 fluoro project GUI (Streamlit).
 
-The single entry point. It only handles navigation and layout; each downstream
-module (mzml_tools, insilico_library, comparison, explorer) owns its own page
-in its `gui.py`, calling back into that module's own logic file. main.py
-never contains science logic itself.
+The single entry point. It only handles navigation, layout, and theming;
+each downstream module (setup, mzml_tools, insilico_library, comparison,
+explorer) owns its own page in its `gui.py`, calling back into that module's
+own logic file. main.py never contains science logic itself -- including the
+7-stage pipeline stepper below: main.py only *assembles* that status from
+each module's own pure, side-effect-free status function (e.g.
+`setup.gui.acquire_data_status`), never computes it itself.
 
-Navigation is `st.navigation` (a sidebar page list), not `st.tabs`: tabs
-execute every tab's code on every single rerun, no matter which tab is
-visible on screen -- confirmed directly (a heavy MS Matching page kept
-re-rendering on clicks made entirely inside the unrelated Molecule Explorer
-tab, since Streamlit only hides an inactive tab's DOM output, it doesn't
-skip running its code). `st.navigation` only runs the current page's code,
-which is the real speed win -- at the cost of clearing a widget's own keyed
-session_state whenever its page is unmounted (confirmed directly too: a
-checkbox's value came back `None` after navigating away and back). Every
-module works around that via `common.ui.restore`/`persist`, which mirror a
-widget's value into a plain session_state entry (under `_persistent_settings`)
-that `st.navigation` does *not* clear (also confirmed directly: an ordinary
-session_state assignment, not tied to any widget's `key=`, survived
-navigating away and back intact). That same store is what `preset_controls`
-saves/loads as a named JSON file under `configs/` (gitignored).
+Navigation is a hand-rolled top nav bar + `st.session_state["page"]` +
+if/elif dispatch, not `st.navigation` -- ported from the "Blueprint
+Brutalist" visual-design round (see `design/07.2_blueprint_brutalist.py` in
+the parent project folder; not part of this repo). Exactly one
+`PAGE_RENDERERS[...]()` call runs per rerun either way, so this keeps
+`st.navigation`'s real perf win over `st.tabs` (which runs every tab's code
+on every rerun, confirmed directly in an earlier version of this app).
+
+`st.navigation`'s specific *page-unmount* behaviour (clearing a widget's own
+keyed session_state the moment its page stops being the active one) is what
+originally made `common.ui.restore`/`persist` necessary. Plain if/elif
+dispatch doesn't have that specific trigger -- a widget not instantiated on a
+given rerun simply keeps whatever value it already had in session_state, for
+the life of the session -- but `restore`/`persist` are kept exactly as they
+were anyway: `save_preset`/`load_preset` still depend on the same persistent
+store, and every existing `restore()` call is a no-op once its key exists, so
+nothing about this swap requires touching any of the five module `gui.py`
+files' own use of them.
+
+The stepper's render is deliberately deferred until *after* page dispatch
+(filled into a `nav_slot` reserved before dispatch) -- see the comment at the
+fill site below for the bug this fixes.
 
 Run with:
     streamlit run main.py
@@ -30,84 +40,126 @@ import sys
 
 import streamlit as st
 
-st.set_page_config(page_title="DUF62 Fluoro Project", layout="wide")
+st.set_page_config(page_title="DUF62 Fluoro Project", page_icon="📐", layout="wide")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common.ui import preset_controls  # noqa: E402
+from common.ui import (  # noqa: E402
+    NAV_PAGES, PALETTE_MODES, PALETTE_SWATCH_LETTER, PIPELINE_ORDER,
+    STAGE_GLYPH, STAGE_LABELS, STAGE_TARGET_PAGE, STATIC_CSS,
+    build_dynamic_css, build_palette_css, build_sheet_tab_css, compute_current_stage,
+    preset_controls, run_boot_gate,
+)
+
+import setup.gui as setup_gui  # noqa: E402
+import mzml_tools.gui as scan_gui  # noqa: E402
+import insilico_library.gui as library_gui  # noqa: E402
+import comparison.gui as match_gui  # noqa: E402
+import explorer.gui as explorer_gui  # noqa: E402
+
+st.session_state.setdefault("booted", False)
+st.session_state.setdefault("boot_start", None)
+st.session_state.setdefault("page", "setup")
+st.session_state.setdefault("palette_mode", "blue")
+
+run_boot_gate()
+
+PAGE_RENDERERS = {
+    "setup": setup_gui.render,
+    "scan": scan_gui.render,
+    "library": library_gui.render,
+    "match": match_gui.render,
+    "explorer": explorer_gui.render,
+}
 
 
-def _setup_page():
-    import setup.gui as gui
-
-    # The app-level title/caption only makes sense once, on the landing
-    # page -- every other page already has its own `page_header()` title,
-    # so repeating this banner above it on all five pages was pure
-    # redundancy.
-    st.title("DUF62 Fluoro Project")
-    st.caption(
-        "Finding naturally fluoroacetylated plant metabolites via an in-silico "
-        "suspect library matched against LC-HRMS data."
-    )
-    gui.render()
-
-
-def _mzml_page():
-    import mzml_tools.gui as gui
-
-    gui.render()
+def _compute_real_stage_status() -> dict:
+    """Assemble the 7-stage pipeline status from each module's own pure
+    status function -- see this file's own docstring for why main.py never
+    computes any of these itself."""
+    return {
+        "acquire_data": setup_gui.acquire_data_status(),
+        "link_library": setup_gui.link_library_status(),
+        "lib_normalize": library_gui.normalize_status(),
+        "lib_build_suspects": library_gui.build_status(),
+        "calibrate_match": match_gui.calibrate_status(),
+        "execute_match": match_gui.execute_match_status(),
+        "review_output": explorer_gui.review_output_status(),
+    }
 
 
-def _insilico_page():
-    import insilico_library.gui as gui
-
-    gui.render()
-
-
-def _comparison_page():
-    import comparison.gui as gui
-
-    gui.render()
-
-
-def _explorer_page():
-    import explorer.gui as gui
-
-    gui.render()
-
-
-# Streamlit's top-right "running" indicator has a fixed, non-configurable
-# icon (an animated running-man SVG) -- there's no config/theme/API option
-# to change it. This hides just that icon via its internal data-testid,
-# leaving the "Stop" button next to it (genuinely useful for a long-running
-# match) untouched. Depends on Streamlit's current internal markup, not a
-# public API -- may need updating if a Streamlit upgrade renames it.
-st.html("<style>[data-testid='stStatusWidgetRunningIcon'] { display: none; }</style>")
-
-# No native `st.set_page_config`/theme option controls the sidebar's pixel
-# width (only open/collapsed state) -- CSS is the only lever. Streamlit's own
-# default range is a *fixed*, non-relative `min-width: 200px; max-width:
-# 600px` -- overridden here with a percentage range instead, so the sidebar
-# actually scales with screen width, and drag-resizing still works anywhere
-# inside that range. Deliberately NOT setting `width` itself (an earlier
-# version did, pinned to an exact px value): that fought every drag attempt
-# -- Streamlit's own resize handler sets `width` as an inline style on each
-# drag move, and a `width: ... !important` rule here would silently snap it
-# straight back, making the sidebar look frozen/unmovable. Leaving `width`
-# alone lets Streamlit's own current/dragged value stand; only the outer
-# min/max range is widened.
-st.html(
-    "<style>[data-testid='stSidebar'] { min-width: 10% !important; "
-    "max-width: 20% !important; }</style>"
+# Two existing, load-bearing CSS fixes, merged into the one combined
+# stylesheet below rather than issued as separate st.html() calls: hiding
+# Streamlit's fixed, non-configurable "running" icon (its data-testid is
+# internal, not a public API -- may need updating on a Streamlit upgrade),
+# and widening the sidebar's drag-resize range to a percentage instead of
+# Streamlit's fixed default px range (deliberately not setting `width`
+# itself here -- that fights Streamlit's own drag handler, which sets
+# `width` as an inline style on every drag move).
+_EXTRA_CSS = (
+    "[data-testid='stStatusWidgetRunningIcon'] { display: none; }"
+    "[data-testid='stSidebar'] { min-width: 10% !important; max-width: 20% !important; }"
 )
 
 with st.sidebar:
     preset_controls()
 
-pg = st.navigation([
-    st.Page(_setup_page, title="Setup"),
-    st.Page(_mzml_page, title="mzML Scan Detector"),
-    st.Page(_insilico_page, title="In-silico Library"),
-    st.Page(_comparison_page, title="MS Matching"),
-    st.Page(_explorer_page, title="Molecule Explorer"),
-])
-pg.run()
+st.html('<div class="blueprint-title"><span class="name">DUF62 FLUORO PROJECT</span></div>')
+
+with st.container(key="palette_selector"):
+    with st.container(key="palette_swatch_row"):
+        swatch_cols = st.columns(4)
+        for col, mode_key in zip(swatch_cols, PALETTE_MODES):
+            with col:
+                if st.button(PALETTE_SWATCH_LETTER[mode_key], key=f"palette_{mode_key}", width="content"):
+                    st.session_state.palette_mode = mode_key
+                    st.rerun()
+
+# Reserved slot -- filled further below, AFTER page dispatch, so the
+# stepper's colors reflect anything the page body just mutated in this same
+# run (see the fix note at the fill site for why this matters).
+nav_slot = st.container()
+st.html("<hr/>")
+
+PAGE_RENDERERS[st.session_state.page]()  # completion flags may get mutated here
+
+# Bug this fixes (carried over from the design round): the stepper used to
+# be computed AND rendered before page dispatch. That only self-corrected
+# because every RUN-style button happened to pair its flag mutation with an
+# immediate st.rerun() -- a fragile convention, not a structural guarantee,
+# and real code here is *not* uniformly disciplined about that (e.g. mzML
+# Scan Detector's "Find scans" button falls through to the rest of the
+# script instead of rerunning). Recomputing fresh here, using anything the
+# page body above just mutated, then filling the reserved nav_slot, means
+# the stepper reflects this run's own changes immediately regardless of
+# whether that page happened to call st.rerun().
+_stage_status = _compute_real_stage_status()
+_current_stage = compute_current_stage(_stage_status)
+with nav_slot:
+    st.html(
+        "<style>"
+        + STATIC_CSS
+        + build_palette_css(st.session_state.get("palette_mode", "blue"))
+        + build_sheet_tab_css()
+        + build_dynamic_css(st.session_state.page, _stage_status, _current_stage)
+        + _EXTRA_CSS
+        + "</style>"
+    )
+
+    nav_cols = st.columns(len(NAV_PAGES))
+    for col, (page_key, label) in zip(nav_cols, NAV_PAGES):
+        with col:
+            if st.button(label, key=f"nav_{page_key}", width="stretch"):
+                st.session_state.page = page_key
+                st.rerun()
+
+    st.html('<div class="stepper-wrap"></div>')
+    with st.container(key="stepper_row"):
+        step_cols = st.columns(len(PIPELINE_ORDER))
+        for col, stage_key in zip(step_cols, PIPELINE_ORDER):
+            with col:
+                status = _stage_status[stage_key]
+                glyph = STAGE_GLYPH[status]
+                label = f"{glyph}\n{STAGE_LABELS[stage_key]}"
+                if st.button(label, key=f"step_{stage_key}", width="stretch"):
+                    st.session_state.page = STAGE_TARGET_PAGE[stage_key]
+                    st.rerun()

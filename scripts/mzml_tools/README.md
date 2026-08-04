@@ -48,12 +48,19 @@ export_matches_csv(matches, "output/hits.csv")
 ```
 
 ## `gui.py`
-The Streamlit page (rendered from `main.py`): pick one or more mzML files (with
-a selector to switch which one is currently active) → see its overview → type
-a target m/z/tolerance/MS level/relative-intensity filter → run → sortable
-results table, CSV download, an interactive RT-vs-relative-intensity scatter
-(Plotly, sized by intensity, colored by MS level), and a "Compute XIC" button
-for a live extracted-ion chromatogram at any MS level.
+The Streamlit page (rendered from `main.py`), built from four bordered
+sheets (`common.ui`'s shared LOAD/PARAMETERS/RUN/ANALYZE convention, see
+`scripts/README.md`): LOAD (pick one or more mzML files, with a selector to
+switch which one is currently active, plus the file overview) → PARAMETERS
+(target m/z/tolerance/MS level/relative-intensity filter, plus the
+diagnostic-ion-targets manager below) → RUN (the search button alone) →
+ANALYZE (sortable results table, CSV download, an interactive
+RT-vs-relative-intensity scatter sized by intensity/colored by MS level,
+and a "Compute XIC" button for a live extracted-ion chromatogram at any MS
+level -- gated on a search having actually run this session, not shown
+until then). This page is deliberately never a pipeline-stepper target
+(see `scripts/README.md`) -- diagnostic-ion curation is optional tooling
+that feeds MS Matching's MS2 filter, not a mandatory stage.
 
 **Diagnostic ion targets**: a separate, curated list of candidate fragment-ion
 m/z values (add/remove, each with a "use in filter" checkbox and an "Explore"
@@ -79,10 +86,11 @@ save_xic_figure("file.mzML", target_mz=150.0, tolerance=15, unit="ppm",
 ```
 
 ## Folders
-- `data/`   — put input mzML here (gitignored). The real project data lives
-  outside this repository; the GUI's file picker looks for it in a sibling
-  data folder automatically (see `common/ui.py`), and falls back to manual
-  path entry if none is found.
+- `data/`   — put input mzML here (gitignored). The GUI's file picker itself
+  is manual path entry only (one full path per line) -- `common.ui.find_mzml_files`/
+  `DEFAULT_HRMS_DIR` still auto-discover files under a sibling `data/mzml/`
+  for the CLI scripts that use them directly, but the GUI picker dropped
+  that half (see `common/ui.py`'s own docstring for why).
 - `output/` — CSV exports and figures land here (gitignored; auto-created at runtime).
 
 ## Status

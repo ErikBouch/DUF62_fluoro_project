@@ -17,7 +17,9 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from comparison import plotting  # noqa: E402
 from comparison.matcher import isomers_for_formula, structures_by_formula  # noqa: E402
-from common.ui import persist, resolved_shared_mzml_files, restore, status_button  # noqa: E402
+from common.ui import (  # noqa: E402
+    awaiting_input, persist, resolved_shared_mzml_files, restore, status_button,
+)
 from explorer.gallery import DEFAULT_SORT, PAGE_SIZE, SORT_OPTIONS, paginate, sort_structures  # noqa: E402
 
 # Reused directly from comparison/gui.py rather than duplicated: Molecule
@@ -39,29 +41,29 @@ _CARD_CSS = """
 <style>
 .mol-card {
     position: relative;
-    border: 1px solid #334155;
+    border: 1px solid var(--ink-dim);
     border-radius: 10px;
     padding: 10px;
     margin-bottom: 4px;
     text-align: center;
-    background: #1e293b;
+    background: var(--panel);
 }
 .mol-card img { max-width: 100%; height: auto; }
-.mol-card-formula { font-weight: 600; font-size: 1.0rem; margin-top: 4px; color: #e2e8f0; }
-.mol-card-stats { font-size: 0.85rem; color: #94a3b8; }
+.mol-card-formula { font-weight: 600; font-size: 1.0rem; margin-top: 4px; color: var(--text); }
+.mol-card-stats { font-size: 0.85rem; color: var(--ink-dim); }
 .mol-card-hover {
     display: none;
     position: absolute;
     top: 6px; left: 6px; right: 6px;
-    background: rgba(15, 23, 42, 0.97);
-    color: #e2e8f0;
+    background: var(--panel-85);
+    color: var(--text);
     padding: 10px;
     border-radius: 8px;
     z-index: 20;
     text-align: left;
     font-size: 0.8rem;
     line-height: 1.5;
-    border: 1px solid #2dd4bf;
+    border: 1px solid var(--ink);
 }
 .mol-card:hover .mol-card-hover { display: block; }
 </style>
@@ -152,6 +154,23 @@ def _render_card(row):
         if st.button(f"Explore {row.n_isomers} isomers", key=f"explore_{row.product_formula}", width="stretch"):
             _isomers_dialog(row.product_formula, st.session_state["cmp_candidate_table"],
                              st.session_state["cmp_features_for_summary"])
+
+
+def review_output_status() -> str:
+    """'done' if explorer_reviewed is True (the card grid has actually been
+    rendered for a non-empty result this session); 'failed' if
+    explorer_last_result_empty is True (a result loaded but had no
+    structures to show); else 'todo'. Pure, side-effect-free -- read by
+    main.py's pipeline stepper on every rerun, regardless of which page is
+    currently showing. Both flags are reset to False by
+    `comparison.gui._populate_result_session_state()` whenever genuinely new
+    data loads, so a stale "done"/"failed" from a previous result never
+    lingers once a fresh one is loaded."""
+    if st.session_state.get("explorer_reviewed"):
+        return "done"
+    if st.session_state.get("explorer_last_result_empty"):
+        return "failed"
+    return "todo"
 
 
 def _render_show_current_results():
@@ -282,7 +301,7 @@ def _render_data_loader():
     picker is toggled open) does anything else on the page appear -- nothing
     sits here permanently just in case it's needed.
     """
-    st.info("No data loaded yet.")
+    awaiting_input("No data loaded yet.", key="await_explorer_data")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -317,8 +336,11 @@ def render():
     all_structures = st.session_state["_explorer_all_structures"]
 
     if all_structures.empty:
+        st.session_state["explorer_last_result_empty"] = True
         st.warning("No structures to show.")
         return
+
+    st.session_state["explorer_reviewed"] = True
 
     error = plotting.structure_rendering_error()
     if error:

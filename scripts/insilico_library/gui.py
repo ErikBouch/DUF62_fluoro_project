@@ -28,6 +28,15 @@ Two top-level workflows (a choice, not both shown at once -- see `render()`):
   just because a file happens to already exist on disk from an earlier
   session -- that ambiguity (is this fresh or stale?) is exactly what the
   two-workflow split above resolves.
+
+`normalize_status()`/`build_status()` (below) are the pure, side-effect-free
+counterparts main.py's 7-stage pipeline stepper calls on every rerun,
+regardless of which page is active -- they must never render anything
+(st.error/st.button/etc.), which is why the on-disk validity check each one
+needs is factored out into its own pure helper
+(`_normalized_file_is_valid()` / `_suspect_library_file_is_valid()`) that the
+existing display functions call too, rather than duplicating the same column
+check in two places.
 """
 from __future__ import annotations
 
@@ -75,6 +84,81 @@ def _guess_column(columns: list[str], target_name: str, none_option: str) -> str
     """Exact (case-insensitive) column-name match only -- e.g. never lets "inchikey" match a guess for "inchi"."""
     lower = {c.lower(): c for c in columns}
     return lower.get(target_name, none_option)
+
+
+_NORMALIZED_REQUIRED_COLS = {"inchi", "source_db"}
+
+
+def _normalized_file_is_valid() -> bool:
+    """
+    Pure check: does `_NORMALIZED_PATH` exist on disk and have every column
+    Build/the "load existing" workflow actually depend on. No `st.*`
+    rendering calls -- this is the one source of truth for "is the
+    normalized file usable," called both by `_load_normalized()` (which adds
+    the error/delete-button display on top) and by `normalize_status()`
+    (which must never render anything, since main.py calls it every rerun
+    regardless of which page is showing).
+    """
+    if not os.path.isfile(_NORMALIZED_PATH):
+        return False
+    normalized = _cached_parquet(_NORMALIZED_PATH, os.path.getmtime(_NORMALIZED_PATH))
+    return not (_NORMALIZED_REQUIRED_COLS - set(normalized.columns))
+
+
+def _suspect_library_file_is_valid(path: str) -> bool:
+    """
+    Pure check: does `path` exist on disk and look like a built suspect
+    library (has a `reaction` column). No `st.*` rendering calls -- the one
+    source of truth for "is this suspect library usable," called both by
+    `_render_suspect_library_stats()` (which adds the error display on top)
+    and by `build_status()` (which must never render anything).
+    """
+    if not os.path.isfile(path):
+        return False
+    mono = _cached_parquet(path, os.path.getmtime(path))
+    return "reaction" in mono.columns
+
+
+def normalize_status() -> str:
+    """
+    Pure pipeline-status check for main.py's stepper (`lib_normalize` stage)
+    -- no `st.*` rendering calls, safe to call on every rerun regardless of
+    which page is active.
+
+    "failed" takes priority whenever this session's own Normalize run just
+    parsed 0 rows (`insilico_normalize_last_run_failed`, set/cleared in
+    `_render_generate_workflow`'s Normalize branch) -- otherwise a stale,
+    still-malformed file from an earlier session could mask a fresh success,
+    or a fresh failure could get silently overridden by an old, still-valid
+    file sitting on disk. "done" covers both a fresh success this session
+    and a valid file already on disk from a previous one.
+    """
+    if st.session_state.get("insilico_normalize_last_run_failed"):
+        return "failed"
+    if st.session_state.get("insilico_just_normalized"):
+        return "done"
+    if not os.path.isfile(_NORMALIZED_PATH):
+        return "todo"
+    return "done" if _normalized_file_is_valid() else "failed"
+
+
+def build_status() -> str:
+    """
+    Pure pipeline-status check for main.py's stepper (`lib_build_suspects`
+    stage) -- no `st.*` rendering calls, safe to call on every rerun
+    regardless of which page is active.
+
+    Per-row RDKit errors during a normal build (`n_errors` in the run log)
+    are expected/normal, not a pipeline failure -- only a missing `reaction`
+    column on the resolved suspect-library path (the same one "load
+    existing" shows) counts as "failed" here.
+    """
+    if st.session_state.get("insilico_just_built"):
+        return "done"
+    path = _resolve_suspect_library_path()
+    if not os.path.isfile(path):
+        return "todo"
+    return "done" if _suspect_library_file_is_valid(path) else "failed"
 
 
 def _render_source_and_mapping():
@@ -148,9 +232,6 @@ def _render_source_and_mapping():
     )
 
 
-_NORMALIZED_REQUIRED_COLS = {"inchi", "source_db"}
-
-
 def _load_normalized():
     """
     Load+validate the current normalized table from disk, or `None` if it
@@ -158,7 +239,9 @@ def _load_normalized():
     malformed (e.g. left over from a Normalize run that parsed 0 rows) --
     worth surfacing regardless of which workflow is active below, since a
     broken file blocks both "load existing" and Build (which reads this same
-    file in "generate a new one").
+    file in "generate a new one"). Validity itself is
+    `_normalized_file_is_valid()` -- this only adds the display on top, so
+    that check is never duplicated.
 
     Deliberately separate from displaying its stats (`_render_normalized_stats`):
     Build needs to know whether a usable normalized table exists regardless
@@ -168,8 +251,8 @@ def _load_normalized():
     if not os.path.isfile(_NORMALIZED_PATH):
         return None
     normalized = _cached_parquet(_NORMALIZED_PATH, os.path.getmtime(_NORMALIZED_PATH))
-    missing = _NORMALIZED_REQUIRED_COLS - set(normalized.columns)
-    if missing:
+    if not _normalized_file_is_valid():
+        missing = _NORMALIZED_REQUIRED_COLS - set(normalized.columns)
         st.error(
             f"`{os.path.basename(_NORMALIZED_PATH)}` is missing expected column(s) "
             f"({', '.join(sorted(missing))}) -- most likely left over from a normalize run "
@@ -216,10 +299,10 @@ def _render_suspect_library_stats(path: str):
     if not os.path.isfile(path):
         st.info("Suspect library not built yet.")
         return
-    mono = _cached_parquet(path, os.path.getmtime(path))
-    if "reaction" not in mono.columns:
+    if not _suspect_library_file_is_valid(path):
         st.error(f"`{os.path.basename(path)}` doesn't look like a built suspect library (no `reaction` column).")
         return
+    mono = _cached_parquet(path, os.path.getmtime(path))
     if path != _SUSPECT_MONO_PATH:
         st.caption(f"Showing `{path}` (set on the Setup page).")
     c1, c2, c3 = st.columns(3)
@@ -238,18 +321,19 @@ def _render_load_existing_workflow():
     "here's what you just built" with "here's some possibly-stale leftover
     from a previous run" the way the single unconditional view used to.
     """
-    st.subheader("Normalized library")
-    normalized = _load_normalized()
-    if normalized is None:
-        st.caption("No normalized library found yet.")
-    else:
-        _render_normalized_stats(normalized)
-        render_run_log(_OUTPUT_DIR, title="Normalize run history", filename=_NORMALIZE_RUN_LOG)
+    with st.container(key="sheet_lib_load_normalized"):
+        st.subheader("Normalized library")
+        normalized = _load_normalized()
+        if normalized is None:
+            st.caption("No normalized library found yet.")
+        else:
+            _render_normalized_stats(normalized)
+            render_run_log(_OUTPUT_DIR, title="Normalize run history", filename=_NORMALIZE_RUN_LOG)
 
-    st.divider()
-    st.subheader("Suspect library")
-    _render_suspect_library_stats(_resolve_suspect_library_path())
-    render_run_log(_OUTPUT_DIR, title="Build run history", filename=_BUILD_RUN_LOG)
+    with st.container(key="sheet_lib_load_suspect"):
+        st.subheader("Suspect library")
+        _render_suspect_library_stats(_resolve_suspect_library_path())
+        render_run_log(_OUTPUT_DIR, title="Build run history", filename=_BUILD_RUN_LOG)
 
 
 def _render_generate_workflow():
@@ -264,131 +348,134 @@ def _render_generate_workflow():
     real normalized table exists, not whether *this* session is the one that
     produced it.
     """
-    mapping = _render_source_and_mapping()
+    with st.container(key="sheet_lib_gen_source"):
+        mapping = _render_source_and_mapping()
 
-    st.divider()
-    st.subheader("1. Normalize")
-    st.caption(
-        "Computes inchikey/formula for every row via RDKit, deduplicated by structure (InChIKey)."
-    )
-    normalize_ready = mapping is not None
-    normalize_status = (
-        "Possible -- will parse and deduplicate the mapped column(s) above."
-        if normalize_ready else "Not possible yet -- map a structure column above first."
-    )
-    if status_button("Normalize library", "insilico_btn_normalize", normalize_ready, normalize_status):
-        raw, inchi_col, smiles_col, name_col, organism_col, source_label = mapping
-        from insilico_library.db_loader import load_user_table, merge_rows
-
-        t0 = time.time()
-        status = st.empty()
-        progress_bar = st.progress(0.0)
-        status.text(f"Parsing {len(raw)} rows...")
-        rows, stats = load_user_table(
-            raw, inchi_col=inchi_col, smiles_col=smiles_col, name_col=name_col, organism_col=organism_col,
-            source_label=source_label or "user", progress_callback=status.text,
-            progress_fraction_callback=progress_bar.progress,
+    with st.container(key="sheet_lib_gen_normalize"):
+        st.subheader("1. Normalize")
+        st.caption(
+            "Computes inchikey/formula for every row via RDKit, deduplicated by structure (InChIKey)."
         )
-        status.empty()
-        progress_bar.empty()
+        normalize_ready = mapping is not None
+        normalize_status_text = (
+            "Possible -- will parse and deduplicate the mapped column(s) above."
+            if normalize_ready else "Not possible yet -- map a structure column above first."
+        )
+        if status_button("Normalize library", "insilico_btn_normalize", normalize_ready, normalize_status_text):
+            raw, inchi_col, smiles_col, name_col, organism_col, source_label = mapping
+            from insilico_library.db_loader import load_user_table, merge_rows
 
-        if stats.n_parsed_ok == 0:
-            mapped = " / ".join(f"{label} = '{col}'" for label, col in (("InChI", inchi_col), ("SMILES", smiles_col)) if col)
-            st.error(
-                f"0 of {stats.n_records_seen} rows parsed as a valid structure from {mapped}. "
-                f"Double check that column actually holds InChI or SMILES text."
+            t0 = time.time()
+            status = st.empty()
+            progress_bar = st.progress(0.0)
+            status.text(f"Parsing {len(raw)} rows...")
+            rows, stats = load_user_table(
+                raw, inchi_col=inchi_col, smiles_col=smiles_col, name_col=name_col, organism_col=organism_col,
+                source_label=source_label or "user", progress_callback=status.text,
+                progress_fraction_callback=progress_bar.progress,
             )
-        else:
-            status.text("Deduplicating by structure...")
-            normalized = merge_rows([rows])
-            os.makedirs(_OUTPUT_DIR, exist_ok=True)
-            normalized.to_parquet(_NORMALIZED_PATH, index=False)
             status.empty()
+            progress_bar.empty()
+
+            if stats.n_parsed_ok == 0:
+                mapped = " / ".join(f"{label} = '{col}'" for label, col in (("InChI", inchi_col), ("SMILES", smiles_col)) if col)
+                st.error(
+                    f"0 of {stats.n_records_seen} rows parsed as a valid structure from {mapped}. "
+                    f"Double check that column actually holds InChI or SMILES text."
+                )
+                st.session_state["insilico_normalize_last_run_failed"] = True
+            else:
+                status.text("Deduplicating by structure...")
+                normalized = merge_rows([rows])
+                os.makedirs(_OUTPUT_DIR, exist_ok=True)
+                normalized.to_parquet(_NORMALIZED_PATH, index=False)
+                status.empty()
+
+                st.cache_data.clear()
+                append_run(_OUTPUT_DIR, {
+                    "source": source_label or "user",
+                    "n_records_seen": stats.n_records_seen,
+                    "n_parsed_ok": stats.n_parsed_ok,
+                    "n_parse_failed": stats.n_parse_failed,
+                    "n_unique_structures": len(normalized),
+                    "duration_seconds": round(time.time() - t0, 1),
+                }, filename=_NORMALIZE_RUN_LOG)
+                st.session_state["insilico_normalize_last_run_failed"] = False
+                st.session_state["insilico_just_normalized"] = True
+                notify_done(
+                    "insilico_normalize",
+                    f"Parsed {stats.n_parsed_ok}/{stats.n_records_seen} rows ok "
+                    f"({stats.n_parse_failed} failed) -> {len(normalized)} unique structures.",
+                )
+
+        render_last_notification("insilico_normalize")
+        if st.session_state.get("insilico_just_normalized"):
+            just_normalized = _load_normalized()
+            if just_normalized is not None:
+                _render_normalized_stats(just_normalized)
+            render_run_log(_OUTPUT_DIR, title="Normalize run history", filename=_NORMALIZE_RUN_LOG)
+
+    with st.container(key="sheet_lib_gen_build"):
+        st.subheader("2. Build suspect library")
+        st.caption("Runs the acetyl/fluoroacetyl acylation reactions over every normalized, primary-amine-bearing compound.")
+
+        normalized_for_build = _load_normalized()
+        build_ready = normalized_for_build is not None
+        build_status_text = (
+            f"Possible -- {len(normalized_for_build)} unique structures ready to react." if build_ready
+            else "Not possible yet -- normalize a library above first."
+        )
+        if status_button("Build suspect library", "insilico_btn_build", build_ready, build_status_text):
+            from insilico_library.acylation import REACTIVE_GROUP_LABEL
+            from insilico_library.build_suspect_library import build_library
+            from insilico_library.db_loader import compute_exact_mass_series, compute_primary_amine_flags
+
+            normalized = normalized_for_build
+            t0 = time.time()
+            with st.spinner("Finding primary-amine-bearing structures..."):
+                primary_amine_df = normalized[compute_primary_amine_flags(normalized["inchi"])].reset_index(drop=True)
+                primary_amine_df["exact_mass"] = compute_exact_mass_series(primary_amine_df["inchi"])
+            status = st.empty()
+            progress_bar = st.progress(0.0)
+            status.text(f"Processing {len(primary_amine_df)} primary-amine compounds...")
+            mono_rows, multi_rows, n_processed, n_multisite, n_errors = build_library(
+                primary_amine_df, progress_every=1000, progress_callback=status.text,
+                progress_fraction_callback=progress_bar.progress,
+            )
+            status.empty()
+            progress_bar.empty()
+
+            import pandas as pd
+
+            mono_df = pd.DataFrame(mono_rows)
+            multi_df = pd.DataFrame(multi_rows)
+            os.makedirs(_OUTPUT_DIR, exist_ok=True)
+            mono_df.to_parquet(_SUSPECT_MONO_PATH, index=False)
+            multi_df.to_parquet(_SUSPECT_MULTI_PATH, index=False)
 
             st.cache_data.clear()
             append_run(_OUTPUT_DIR, {
-                "source": source_label or "user",
-                "n_records_seen": stats.n_records_seen,
-                "n_parsed_ok": stats.n_parsed_ok,
-                "n_parse_failed": stats.n_parse_failed,
-                "n_unique_structures": len(normalized),
+                "reactive_functional_group": REACTIVE_GROUP_LABEL,
+                "n_normalized_compounds": len(normalized),
+                "n_reactive_compounds": len(primary_amine_df),
+                "n_processed": n_processed,
+                "n_product_rows": len(mono_df),
+                "n_multisite_compounds": n_multisite,
+                "n_multidegree_rows": len(multi_df),
+                "n_errors": n_errors,
                 "duration_seconds": round(time.time() - t0, 1),
-            }, filename=_NORMALIZE_RUN_LOG)
-            st.session_state["insilico_just_normalized"] = True
+            }, filename=_BUILD_RUN_LOG)
+            st.session_state["insilico_just_built"] = True
             notify_done(
-                "insilico_normalize",
-                f"Parsed {stats.n_parsed_ok}/{stats.n_records_seen} rows ok "
-                f"({stats.n_parse_failed} failed) -> {len(normalized)} unique structures.",
+                "insilico_build",
+                f"{n_processed} compounds processed, {len(mono_df)} product rows "
+                f"({n_multisite} with >1 reactive site), {n_errors} errors.",
             )
 
-    render_last_notification("insilico_normalize")
-    if st.session_state.get("insilico_just_normalized"):
-        just_normalized = _load_normalized()
-        if just_normalized is not None:
-            _render_normalized_stats(just_normalized)
-        render_run_log(_OUTPUT_DIR, title="Normalize run history", filename=_NORMALIZE_RUN_LOG)
-
-    st.divider()
-    st.subheader("2. Build suspect library")
-    st.caption("Runs the acetyl/fluoroacetyl acylation reactions over every normalized, primary-amine-bearing compound.")
-
-    normalized_for_build = _load_normalized()
-    build_ready = normalized_for_build is not None
-    build_status = (
-        f"Possible -- {len(normalized_for_build)} unique structures ready to react." if build_ready
-        else "Not possible yet -- normalize a library above first."
-    )
-    if status_button("Build suspect library", "insilico_btn_build", build_ready, build_status):
-        from insilico_library.acylation import REACTIVE_GROUP_LABEL
-        from insilico_library.build_suspect_library import build_library
-        from insilico_library.db_loader import compute_exact_mass_series, compute_primary_amine_flags
-
-        normalized = normalized_for_build
-        t0 = time.time()
-        with st.spinner("Finding primary-amine-bearing structures..."):
-            primary_amine_df = normalized[compute_primary_amine_flags(normalized["inchi"])].reset_index(drop=True)
-            primary_amine_df["exact_mass"] = compute_exact_mass_series(primary_amine_df["inchi"])
-        status = st.empty()
-        progress_bar = st.progress(0.0)
-        status.text(f"Processing {len(primary_amine_df)} primary-amine compounds...")
-        mono_rows, multi_rows, n_processed, n_multisite, n_errors = build_library(
-            primary_amine_df, progress_every=1000, progress_callback=status.text,
-            progress_fraction_callback=progress_bar.progress,
-        )
-        status.empty()
-        progress_bar.empty()
-
-        import pandas as pd
-
-        mono_df = pd.DataFrame(mono_rows)
-        multi_df = pd.DataFrame(multi_rows)
-        os.makedirs(_OUTPUT_DIR, exist_ok=True)
-        mono_df.to_parquet(_SUSPECT_MONO_PATH, index=False)
-        multi_df.to_parquet(_SUSPECT_MULTI_PATH, index=False)
-
-        st.cache_data.clear()
-        append_run(_OUTPUT_DIR, {
-            "reactive_functional_group": REACTIVE_GROUP_LABEL,
-            "n_normalized_compounds": len(normalized),
-            "n_reactive_compounds": len(primary_amine_df),
-            "n_processed": n_processed,
-            "n_product_rows": len(mono_df),
-            "n_multisite_compounds": n_multisite,
-            "n_multidegree_rows": len(multi_df),
-            "n_errors": n_errors,
-            "duration_seconds": round(time.time() - t0, 1),
-        }, filename=_BUILD_RUN_LOG)
-        st.session_state["insilico_just_built"] = True
-        notify_done(
-            "insilico_build",
-            f"{n_processed} compounds processed, {len(mono_df)} product rows "
-            f"({n_multisite} with >1 reactive site), {n_errors} errors.",
-        )
-
-    render_last_notification("insilico_build")
-    if st.session_state.get("insilico_just_built"):
-        _render_suspect_library_stats(_SUSPECT_MONO_PATH)
-        render_run_log(_OUTPUT_DIR, title="Build run history", filename=_BUILD_RUN_LOG)
+        render_last_notification("insilico_build")
+        if st.session_state.get("insilico_just_built"):
+            _render_suspect_library_stats(_SUSPECT_MONO_PATH)
+            render_run_log(_OUTPUT_DIR, title="Build run history", filename=_BUILD_RUN_LOG)
 
 
 def render():

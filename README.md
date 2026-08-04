@@ -51,10 +51,11 @@ modules from the CLI without the GUI.
 
 ## Your own data
 
-Put mzML files under `data/mzml/` (gitignored, created on demand) and the
-GUI's file pickers will discover them automatically; a library of candidate
-compounds (any CSV/Parquet with a structure column) can point anywhere --
-see the app's Setup page.
+The GUI's file pickers take full paths, entered manually (one per line for
+mzML files) -- point them at wherever your files actually live; a library
+of candidate compounds (any CSV/Parquet with a structure column) works the
+same way. See the app's Setup page, which every other page's own picker
+seeds its default selection from.
 
 ## Citation
 

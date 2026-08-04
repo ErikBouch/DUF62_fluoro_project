@@ -17,8 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.run_log import append_run, render_run_log  # noqa: E402
 from common.ui import (  # noqa: E402
     SHARED_CANDIDATE_TABLE_KEY, SHARED_SUSPECT_LIBRARY_KEY,
-    notify_done, page_header, persist, pick_mzml_files, render_last_notification,
-    resolved_shared_mzml_files, restore, status_button,
+    awaiting_input, mount_key, notify_done, page_header, persist, pick_mzml_files,
+    render_last_notification, resolved_shared_mzml_files, restore, status_button,
 )
 from comparison import plotting  # noqa: E402
 from comparison.matcher import (  # noqa: E402
@@ -50,6 +50,55 @@ def _resolve_library_path() -> str:
     this module's own standard build location."""
     restore(SHARED_SUSPECT_LIBRARY_KEY, _DEFAULT_LIBRARY_PATH if os.path.isfile(_DEFAULT_LIBRARY_PATH) else "")
     return st.session_state.get(SHARED_SUSPECT_LIBRARY_KEY, "") or _DEFAULT_LIBRARY_PATH
+
+
+# "Lock Calibration" (PARAMETERS sheet): a settings-review gate. Locking
+# snapshots every current PARAMETERS-sheet value; if ANY of them change
+# afterward, the lock auto-clears -- otherwise it's a checkbox with no
+# teeth (reviewed-then-silently-stale). See `_calibration_snapshot` and the
+# invalidation check in `render()`, right after the Optional Filters block.
+_CALIBRATION_SNAPSHOT_KEYS = [
+    "cmp_tolerance", "cmp_unit",
+    "cmp_ms_level", "cmp_min_rel", "cmp_min_intensity", "cmp_min_consecutive_scans",
+    "cmp_max_rt_gap", "cmp_check_acetyl", "cmp_acetyl_tolerance", "cmp_acetyl_unit",
+    "cmp_acetyl_rt_window", "cmp_collapse_features", "cmp_check_ms2",
+    "ms2_precursor_tolerance", "ms2_precursor_unit", "ms2_rt_window",
+    "ms2_ion_tolerance", "ms2_ion_unit",
+]
+
+
+def _calibration_snapshot() -> dict:
+    snap = {k: st.session_state.get(k) for k in _CALIBRATION_SNAPSHOT_KEYS}
+    # diagnostic_targets lives on a DIFFERENT page (mzML Scan Detector) but
+    # materially changes what the MS2 filter checks -- without this, editing
+    # a target there would invalidate nothing, defeating the point.
+    targets = st.session_state.get("diagnostic_targets", [])
+    snap["_active_targets"] = sorted(
+        (t["label"], round(t["target_mz"], 6)) for t in targets if t["use_in_filter"]
+    )
+    return snap
+
+
+def calibrate_status() -> str:
+    """'done' if match_calibration_locked is currently True (i.e. "currently
+    locked," not "was ever locked" -- the lock auto-clears the moment any
+    PARAMETERS-sheet value changes, see `_calibration_snapshot`); else
+    'todo'. No 'failed' state. Pure, side-effect-free -- read by main.py's
+    pipeline stepper on every rerun, regardless of which page is currently
+    showing."""
+    return "done" if st.session_state.get("match_calibration_locked") else "todo"
+
+
+def execute_match_status() -> str:
+    """'done' if cmp_candidate_table is in session_state and non-empty;
+    'failed' if present and empty; else 'todo'. Pure, side-effect-free --
+    read by main.py's pipeline stepper on every rerun, regardless of which
+    page is currently showing."""
+    table = st.session_state.get("cmp_candidate_table")
+    if table is None:
+        return "todo"
+    return "failed" if table.empty else "done"
+
 
 # Streamlit's websocket messages (including download_button payloads) are
 # capped at 200 MB; stay well under that so the button itself doesn't crash
@@ -271,10 +320,17 @@ def _populate_result_session_state(candidate_table, max_rt_gap, collapse_feature
     loading the default saved result is always the full, unfiltered result,
     so any leftover "you're viewing the acetyl-only subset" label from an
     earlier variant-browser pick must not persist onto it.
+
+    Also resets Molecule Explorer's own `explorer_reviewed`/
+    `explorer_last_result_empty` flags -- both belong to whatever result was
+    loaded before, not this one, and would otherwise stay stuck reporting a
+    stale previous result forever.
     """
     st.session_state["cmp_active_variant_label"] = None
     st.session_state["cmp_variant_raw_hits_available"] = True
     st.session_state["cmp_saved_stems"] = set()
+    st.session_state["explorer_reviewed"] = False
+    st.session_state["explorer_last_result_empty"] = False
     if features_for_viz is None:
         if not candidate_table.empty:
             features_for_viz = collapse_to_features(candidate_table, max_rt_gap_minutes=max_rt_gap)
@@ -556,157 +612,195 @@ def render():
         "Match the in-silico suspect library against one or more mzML files.",
     )
 
+    st.session_state.setdefault("match_calibration_locked", False)
+
     library_path = _resolve_library_path()
-    if not os.path.isfile(library_path):
-        st.warning(
-            "No suspect library found. Build it first with "
-            "`insilico_library/build_suspect_library.py`."
-        )
-        return
+    library_missing = not os.path.isfile(library_path)
 
-    mtime = os.path.getmtime(library_path)
-    library = _cached_library(library_path, mtime)
-    n_fluoro = (library["reaction"] == "fluoroacetyl").sum()
-    n_acetyl = (library["reaction"] == "acetyl").sum()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Library rows", len(library))
-    c2.metric("Fluoroacetyl products", n_fluoro)
-    c3.metric("Acetyl products", n_acetyl)
-
-    _auto_load_saved_result_once()
-    load_col1, load_col2 = st.columns(2)
-    with load_col1:
-        _render_load_saved_result()
-    with load_col2:
-        _render_output_variant_browser()
-
-    st.divider()
-    st.subheader("Files")
-    file_paths = pick_mzml_files(key="comparison_files", default=resolved_shared_mzml_files())
-
-    st.divider()
-    st.subheader("Filters")
-    st.caption("Tolerance is required; everything else is optional.")
-
-    restore("cmp_tolerance", 0.002)
-    restore("cmp_unit", "Da", valid_options=["Da", "ppm"])
-    col1, col2 = st.columns(2)
-    tolerance = col1.number_input(
-        "Tolerance", min_value=0.0, format="%.4f", key="cmp_tolerance",
-        help="How close an observed m/z must be to one of the suspect library's target masses "
-             "to count as a match. Da is a fixed window at every mass; ppm scales with mass "
-             "(wider window for a heavier ion).",
-    )
-    unit = col2.selectbox("Unit", ["Da", "ppm"], key="cmp_unit")
-    persist("cmp_tolerance")
-    persist("cmp_unit")
-
-    with st.expander("Optional filters"):
-        restore("cmp_ms_level", "1", valid_options=["1", "2", "All"])
-        restore("cmp_min_rel", 0)
-        col3, col4 = st.columns(2)
-        ms_level_choice = col3.selectbox(
-            "MS level", ["1", "2", "All"], key="cmp_ms_level",
-            help="MS1 = the instrument's regular full-scan spectra -- match against this for an "
-                 "intact compound's own mass, which is what the suspect library's target masses "
-                 "are. MS2 (fragment spectra from a selected precursor) is only meaningful here "
-                 "if a target mass happens to also be a known fragment.",
-        )
-        ms_level = None if ms_level_choice == "All" else int(ms_level_choice)
-        min_rel_pct = col4.slider(
-            "Min. relative intensity (%)", 0, 100, key="cmp_min_rel",
-            help="Relative to each scan's own tallest peak, not one global maximum across the "
-                 "file -- the same absolute intensity can pass in a quiet scan and fail in a "
-                 "busy one.",
-        )
-        min_rel = min_rel_pct / 100.0
-        persist("cmp_ms_level")
-        persist("cmp_min_rel")
-
-        restore("cmp_min_intensity", 50_000.0)
-        restore("cmp_min_consecutive_scans", 3)
-        col_int, col_scans = st.columns(2)
-        min_intensity = col_int.number_input(
-            "Min. absolute intensity", min_value=0.0, key="cmp_min_intensity",
-            help="Raw instrument units. A peak below this is never counted as a hit; 0 disables.",
-        )
-        min_consecutive_scans = col_scans.number_input(
-            "Min. consecutive scans", min_value=1, step=1, key="cmp_min_consecutive_scans",
-            help="A hit only counts if it's part of a run of at least this many scans "
-                 "in a row (within the RT gap below); 1 disables.",
-        )
-        persist("cmp_min_intensity")
-        persist("cmp_min_consecutive_scans")
-
-        restore("cmp_max_rt_gap", 0.1)
-        max_rt_gap = st.number_input(
-            "Max. RT gap defining \"consecutive\" (minutes)", min_value=0.0,
-            format="%.3f", key="cmp_max_rt_gap",
-            help="Used both by the min. consecutive scans filter and by feature collapsing below.",
-        )
-        persist("cmp_max_rt_gap")
-
-        restore("cmp_check_acetyl", False)
-        check_acetyl = st.checkbox(
-            "Require checking the acetyl analog too (co-occurrence)",
-            key="cmp_check_acetyl",
-            help="Also looks for the same parent compound's acetyl (non-fluorinated) analog "
-                 "nearby -- a fluoroacetylated hit is more credible when its ordinary "
-                 "acetylated counterpart is also present, since both would come from the same "
-                 "underlying acylation chemistry.",
-        )
-        persist("cmp_check_acetyl")
-        acetyl_tolerance, acetyl_unit, acetyl_rt_window = 5.0, "ppm", 2.0
-        if check_acetyl:
-            restore("cmp_acetyl_tolerance", 5.0)
-            restore("cmp_acetyl_unit", "ppm", valid_options=["ppm", "Da"])
-            restore("cmp_acetyl_rt_window", 2.0)
-            col5, col6 = st.columns(2)
-            acetyl_tolerance = col5.number_input(
-                "Acetyl tolerance", min_value=0.0, format="%.4f", key="cmp_acetyl_tolerance",
-                help="Independent from the main match tolerance above -- the acetyl analog can "
-                     "reasonably need a looser or tighter window of its own.",
+    # Hard stop, reskinned: with no suspect library at all, only the LOAD
+    # sheet renders (via `awaiting_input`) -- PARAMETERS/RUN/ANALYZE never
+    # get instantiated, same as the original bare `st.warning(...); return`.
+    with st.container(key=mount_key("sheet_match_load", "sheet_match_load_entered")):
+        if library_missing:
+            awaiting_input(
+                "No suspect library found. Build it first with "
+                "`insilico_library/build_suspect_library.py`.",
+                key="await_match_load",
             )
-            acetyl_unit = col6.selectbox("Acetyl unit", ["ppm", "Da"], key="cmp_acetyl_unit")
-            acetyl_rt_window = st.number_input(
-                "Acetyl RT window (minutes)", min_value=0.0, format="%.3f", key="cmp_acetyl_rt_window",
-                help="The acetyl analog only counts as co-occurring if found within this many "
-                     "minutes of the fluoroacetyl hit's own RT.",
+            return
+
+        mtime = os.path.getmtime(library_path)
+        library = _cached_library(library_path, mtime)
+        n_fluoro = (library["reaction"] == "fluoroacetyl").sum()
+        n_acetyl = (library["reaction"] == "acetyl").sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Library rows", len(library))
+        c2.metric("Fluoroacetyl products", n_fluoro)
+        c3.metric("Acetyl products", n_acetyl)
+
+        _auto_load_saved_result_once()
+        load_col1, load_col2 = st.columns(2)
+        with load_col1:
+            _render_load_saved_result()
+        with load_col2:
+            _render_output_variant_browser()
+
+        st.divider()
+        st.subheader("Files")
+        file_paths = pick_mzml_files(key="comparison_files", default=resolved_shared_mzml_files())
+
+    with st.container(key=mount_key("sheet_match_params", "sheet_match_params_entered")):
+        st.caption(
+            "CALIBRATION: LOCKED" if st.session_state.get("match_calibration_locked")
+            else "CALIBRATION: NOT LOCKED"
+        )
+        st.subheader("Filters")
+        st.caption("Tolerance is required; everything else is optional.")
+
+        restore("cmp_tolerance", 0.002)
+        restore("cmp_unit", "Da", valid_options=["Da", "ppm"])
+        col1, col2 = st.columns(2)
+        tolerance = col1.number_input(
+            "Tolerance", min_value=0.0, format="%.4f", key="cmp_tolerance",
+            help="How close an observed m/z must be to one of the suspect library's target masses "
+                 "to count as a match. Da is a fixed window at every mass; ppm scales with mass "
+                 "(wider window for a heavier ion).",
+        )
+        unit = col2.selectbox("Unit", ["Da", "ppm"], key="cmp_unit")
+        persist("cmp_tolerance")
+        persist("cmp_unit")
+
+        with st.expander("OPTIONAL FILTERS", key="flap_amber_match_optional"):
+            st.html('<div class="sub-header">CORE FILTERS</div>')
+            restore("cmp_ms_level", "1", valid_options=["1", "2", "All"])
+            restore("cmp_min_rel", 0)
+            col3, col4 = st.columns(2)
+            ms_level_choice = col3.selectbox(
+                "MS level", ["1", "2", "All"], key="cmp_ms_level",
+                help="MS1 = the instrument's regular full-scan spectra -- match against this for an "
+                     "intact compound's own mass, which is what the suspect library's target masses "
+                     "are. MS2 (fragment spectra from a selected precursor) is only meaningful here "
+                     "if a target mass happens to also be a known fragment.",
             )
-            persist("cmp_acetyl_tolerance")
-            persist("cmp_acetyl_unit")
-            persist("cmp_acetyl_rt_window")
+            ms_level = None if ms_level_choice == "All" else int(ms_level_choice)
+            min_rel_pct = col4.slider(
+                "Min. relative intensity (%)", 0, 100, key="cmp_min_rel",
+                help="Relative to each scan's own tallest peak, not one global maximum across the "
+                     "file -- the same absolute intensity can pass in a quiet scan and fail in a "
+                     "busy one.",
+            )
+            min_rel = min_rel_pct / 100.0
+            persist("cmp_ms_level")
+            persist("cmp_min_rel")
 
-        restore("cmp_collapse_features", False)
-        collapse_features = st.checkbox(
-            "Collapse to features (one row per contiguous elution event, instead "
-            "of one row per scan)",
-            key="cmp_collapse_features",
+            st.html('<div class="sub-header">SCAN &amp; RT</div>')
+            restore("cmp_min_intensity", 50_000.0)
+            restore("cmp_min_consecutive_scans", 3)
+            col_int, col_scans = st.columns(2)
+            min_intensity = col_int.number_input(
+                "Min. absolute intensity", min_value=0.0, key="cmp_min_intensity",
+                help="Raw instrument units. A peak below this is never counted as a hit; 0 disables.",
+            )
+            min_consecutive_scans = col_scans.number_input(
+                "Min. consecutive scans", min_value=1, step=1, key="cmp_min_consecutive_scans",
+                help="A hit only counts if it's part of a run of at least this many scans "
+                     "in a row (within the RT gap below); 1 disables.",
+            )
+            persist("cmp_min_intensity")
+            persist("cmp_min_consecutive_scans")
+
+            restore("cmp_max_rt_gap", 0.1)
+            max_rt_gap = st.number_input(
+                "Max. RT gap defining \"consecutive\" (minutes)", min_value=0.0,
+                format="%.3f", key="cmp_max_rt_gap",
+                help="Used both by the min. consecutive scans filter and by feature collapsing below.",
+            )
+            persist("cmp_max_rt_gap")
+
+            st.html('<div class="sub-header">ACETYL CO-OCCURRENCE</div>')
+            restore("cmp_check_acetyl", False)
+            check_acetyl = st.checkbox(
+                "Require checking the acetyl analog too (co-occurrence)",
+                key="cmp_check_acetyl",
+                help="Also looks for the same parent compound's acetyl (non-fluorinated) analog "
+                     "nearby -- a fluoroacetylated hit is more credible when its ordinary "
+                     "acetylated counterpart is also present, since both would come from the same "
+                     "underlying acylation chemistry.",
+            )
+            persist("cmp_check_acetyl")
+            acetyl_tolerance, acetyl_unit, acetyl_rt_window = 5.0, "ppm", 2.0
+            if check_acetyl:
+                restore("cmp_acetyl_tolerance", 5.0)
+                restore("cmp_acetyl_unit", "ppm", valid_options=["ppm", "Da"])
+                restore("cmp_acetyl_rt_window", 2.0)
+                col5, col6 = st.columns(2)
+                acetyl_tolerance = col5.number_input(
+                    "Acetyl tolerance", min_value=0.0, format="%.4f", key="cmp_acetyl_tolerance",
+                    help="Independent from the main match tolerance above -- the acetyl analog can "
+                         "reasonably need a looser or tighter window of its own.",
+                )
+                acetyl_unit = col6.selectbox("Acetyl unit", ["ppm", "Da"], key="cmp_acetyl_unit")
+                acetyl_rt_window = st.number_input(
+                    "Acetyl RT window (minutes)", min_value=0.0, format="%.3f", key="cmp_acetyl_rt_window",
+                    help="The acetyl analog only counts as co-occurring if found within this many "
+                         "minutes of the fluoroacetyl hit's own RT.",
+                )
+                persist("cmp_acetyl_tolerance")
+                persist("cmp_acetyl_unit")
+                persist("cmp_acetyl_rt_window")
+
+            st.html('<div class="sub-header">COLLAPSE TO FEATURES</div>')
+            restore("cmp_collapse_features", False)
+            collapse_features = st.checkbox(
+                "Collapse to features (one row per contiguous elution event, instead "
+                "of one row per scan)",
+                key="cmp_collapse_features",
+            )
+            persist("cmp_collapse_features")
+
+            st.html('<div class="sub-header">MS2 DIAGNOSTIC-ION FILTER</div>')
+            restore("cmp_check_ms2", False)
+            check_ms2 = st.checkbox(
+                "Also require a diagnostic-ion MS2 scan (targets managed on the mzML Scan Detector page)",
+                key="cmp_check_ms2",
+            )
+            persist("cmp_check_ms2")
+            if check_ms2:
+                _render_ms2_filter_settings()
+
+        # Lock Calibration: a settings-review gate, checked unconditionally
+        # on every render, after the Optional Filters block above (so
+        # `.get()` reads this run's just-instantiated widget values) and
+        # before the lock button/caption themselves.
+        current_snapshot = _calibration_snapshot()
+        if st.session_state.get("match_calibration_locked") and \
+           st.session_state.get("match_calibration_snapshot") != current_snapshot:
+            st.session_state["match_calibration_locked"] = False
+            st.session_state.pop("match_calibration_snapshot", None)
+
+        if st.button("LOCK CALIBRATION", key="lock_calibration_btn"):
+            st.session_state["match_calibration_locked"] = True
+            st.session_state["match_calibration_snapshot"] = current_snapshot
+            st.rerun()
+
+        st.caption(
+            ":green[Calibration locked for this session.]"
+            if st.session_state.get("match_calibration_locked")
+            else "Not locked — lock before running to confirm current settings."
         )
-        persist("cmp_collapse_features")
 
-        restore("cmp_check_ms2", False)
-        check_ms2 = st.checkbox(
-            "Also require a diagnostic-ion MS2 scan (targets managed on the mzML Scan Detector page)",
-            key="cmp_check_ms2",
+    with st.container(key=mount_key("sheet_match_run", "sheet_match_run_entered")):
+        run_ready = bool(file_paths)
+        run_status = (
+            f"Possible -- {len(file_paths)} mzML file(s) selected." if run_ready
+            else "Not possible yet -- pick at least one mzML file above."
         )
-        persist("cmp_check_ms2")
-        if check_ms2:
-            _render_ms2_filter_settings()
+        if status_button("Run match", "cmp_btn_run_match", run_ready, run_status):
+            candidate_table = _run_match(library, file_paths)
+            notify_done("comparison_run_match", f"Match finished -- {len(candidate_table)} raw hits across {len(file_paths)} file(s).")
 
-    st.divider()
-
-    run_ready = bool(file_paths)
-    run_status = (
-        f"Possible -- {len(file_paths)} mzML file(s) selected." if run_ready
-        else "Not possible yet -- pick at least one mzML file above."
-    )
-    if status_button("Run match", "cmp_btn_run_match", run_ready, run_status):
-        candidate_table = _run_match(library, file_paths)
-        notify_done("comparison_run_match", f"Match finished -- {len(candidate_table)} raw hits across {len(file_paths)} file(s).")
-
-    render_last_notification("comparison_run_match")
-    render_run_log(_OUTPUT_DIR, title="Run match history", filename=_MATCH_RUN_LOG)
+        render_last_notification("comparison_run_match")
+        render_run_log(_OUTPUT_DIR, title="Run match history", filename=_MATCH_RUN_LOG)
 
     # Not gated on `file_paths` -- a result loaded via "Load previously
     # processed data" above should display regardless of whether any mzML
@@ -715,109 +809,119 @@ def render():
     if candidate_table is None:
         return
 
-    st.divider()
-    if candidate_table.empty:
-        st.warning("No matches found with these settings.")
-        return
+    # ANALYZE is a thin, purely additive wrapper around the existing render
+    # logic below -- same call order, same `_render_table_with_download`
+    # call sites/frequency (its save-once tracking is load-bearing for perf,
+    # see that function's own docstring), just indented one level into this
+    # sheet's container and broken up with sub-header dividers.
+    with st.container(key=mount_key("sheet_match_analyze", "match_analyze_entered")):
+        st.html('<div class="sub-header">OVERVIEW</div>')
+        if candidate_table.empty:
+            st.warning("No matches found with these settings.")
+            return
 
-    active_variant_label = st.session_state.get("cmp_active_variant_label")
-    # A loaded "candidate_features*" variant is already a final, collapsed
-    # table -- it never had (and can't reconstruct) the original raw-hit
-    # rows, so anything that needs `candidate_table` in its raw shape
-    # (`summarize_candidate_table`, `top_structures_by_formula`'s SMILES/name
-    # lookup -- both index straight into it regardless of `features_table`)
-    # would `KeyError` on a features-shaped table's columns. Gate on this
-    # flag rather than trying to fake a raw-hit shape that was never saved.
-    raw_hits_available = st.session_state.get("cmp_variant_raw_hits_available", True)
-    if active_variant_label:
-        st.info(f"**Currently viewing:** {active_variant_label}")
-    else:
-        st.info(f"**Currently viewing:** Full match result -- {len(candidate_table)} raw hits, no filter applied.")
+        active_variant_label = st.session_state.get("cmp_active_variant_label")
+        # A loaded "candidate_features*" variant is already a final, collapsed
+        # table -- it never had (and can't reconstruct) the original raw-hit
+        # rows, so anything that needs `candidate_table` in its raw shape
+        # (`summarize_candidate_table`, `top_structures_by_formula`'s SMILES/name
+        # lookup -- both index straight into it regardless of `features_table`)
+        # would `KeyError` on a features-shaped table's columns. Gate on this
+        # flag rather than trying to fake a raw-hit shape that was never saved.
+        raw_hits_available = st.session_state.get("cmp_variant_raw_hits_available", True)
+        if active_variant_label:
+            st.info(f"**Currently viewing:** {active_variant_label}")
+        else:
+            st.info(f"**Currently viewing:** Full match result -- {len(candidate_table)} raw hits, no filter applied.")
 
-    if raw_hits_available:
-        st.code(format_summary(summarize_candidate_table(candidate_table)), language=None)
-    else:
-        st.caption(
-            "Raw-hit-level summary isn't available for this saved variant -- it's already a "
-            "collapsed features table, which never included the original per-scan rows."
-        )
+        if raw_hits_available:
+            st.code(format_summary(summarize_candidate_table(candidate_table)), language=None)
+        else:
+            st.caption(
+                "Raw-hit-level summary isn't available for this saved variant -- it's already a "
+                "collapsed features table, which never included the original per-scan rows."
+            )
 
-    features_for_viz = st.session_state["cmp_features_for_viz"]
-    features_for_summary = st.session_state["cmp_features_for_summary"]
+        features_for_viz = st.session_state["cmp_features_for_viz"]
+        features_for_summary = st.session_state["cmp_features_for_summary"]
 
-    st.divider()
-    st.subheader("Summary")
-    if not features_for_viz.empty and features_for_viz["acetyl_cooccurs"].notna().any():
-        st.caption(
-            f"Based on the {len(features_for_summary)} of {len(features_for_viz)} features with acetyl "
-            "co-occurrence -- the final, most-filtered result set, not the raw pre-acetyl-check hits."
-        )
-    else:
-        st.caption(f"Based on all {len(features_for_viz)} features (acetyl co-occurrence wasn't checked).")
+        st.divider()
+        st.subheader("Summary")
+        if not features_for_viz.empty and features_for_viz["acetyl_cooccurs"].notna().any():
+            st.caption(
+                f"Based on the {len(features_for_summary)} of {len(features_for_viz)} features with acetyl "
+                "co-occurrence -- the final, most-filtered result set, not the raw pre-acetyl-check hits."
+            )
+        else:
+            st.caption(f"Based on all {len(features_for_viz)} features (acetyl co-occurrence wasn't checked).")
 
-    if check_ms2:
-        _render_ms2_confidence_filter(features_for_summary)
+        if check_ms2:
+            st.html('<div class="sub-header">MS2 DIAGNOSTIC-ION FILTER</div>')
+            _render_ms2_confidence_filter(features_for_summary)
 
-    thresholds = tuple(sorted({min_consecutive_scans, 50, 100, 200, 500}))
-    breakdown = scan_count_breakdown(candidate_table, thresholds=thresholds, features_table=features_for_summary)
-    _render_scan_count_bar(breakdown)
+        st.html('<div class="sub-header">CHARTS</div>')
+        thresholds = tuple(sorted({min_consecutive_scans, 50, 100, 200, 500}))
+        breakdown = scan_count_breakdown(candidate_table, thresholds=thresholds, features_table=features_for_summary)
+        _render_scan_count_bar(breakdown)
 
-    os.makedirs(_FIGURES_DIR, exist_ok=True)
-    plotting.save_scan_count_breakdown_figure(breakdown, os.path.join(_FIGURES_DIR, "scan_count_breakdown.png"))
+        os.makedirs(_FIGURES_DIR, exist_ok=True)
+        plotting.save_scan_count_breakdown_figure(breakdown, os.path.join(_FIGURES_DIR, "scan_count_breakdown.png"))
 
-    if raw_hits_available:
-        top_structures = top_structures_by_formula(candidate_table, top_n=10, features_table=features_for_summary)
-        st.caption(
-            "Top 10 product formulas by total scan evidence (deduplicated -- isomers/salts sharing a formula "
-            "count once; a formula can bundle several distinct structures, see \"1 of N structures\" below)."
-        )
-        grid_image = _render_structure_grid(top_structures)
-        plotting.save_top_structures_grid(grid_image, os.path.join(_FIGURES_DIR, "top_structures.png"))
-    else:
-        st.caption(
-            "Structure grid isn't available for this saved variant -- it needs the original raw-hit "
-            "table's product SMILES/names, which a collapsed features table never included."
-        )
+        if raw_hits_available:
+            top_structures = top_structures_by_formula(candidate_table, top_n=10, features_table=features_for_summary)
+            st.caption(
+                "Top 10 product formulas by total scan evidence (deduplicated -- isomers/salts sharing a formula "
+                "count once; a formula can bundle several distinct structures, see \"1 of N structures\" below)."
+            )
+            grid_image = _render_structure_grid(top_structures)
+            plotting.save_top_structures_grid(grid_image, os.path.join(_FIGURES_DIR, "top_structures.png"))
+        else:
+            st.caption(
+                "Structure grid isn't available for this saved variant -- it needs the original raw-hit "
+                "table's product SMILES/names, which a collapsed features table never included."
+            )
 
-    features_table = st.session_state.get("cmp_features_table")
-    # `save=False` while viewing a specific loaded output/ variant: it's
-    # already on disk under its own name, so re-running the "always save"
-    # behavior here would overwrite a *different* file's canonical name with
-    # this variant's content instead (see `_render_table_with_download`).
-    save_exports = not active_variant_label
-    if features_table is not None and raw_hits_available:
-        view = st.radio(
-            "View", ["Features (collapsed)", "Raw hits"], horizontal=True, key="cmp_view",
-        )
-    elif features_table is not None:
-        view = "Features (collapsed)"
-    else:
-        view = "Raw hits"
+        st.html('<div class="sub-header">RESULTS TABLE</div>')
+        features_table = st.session_state.get("cmp_features_table")
+        # `save=False` while viewing a specific loaded output/ variant: it's
+        # already on disk under its own name, so re-running the "always save"
+        # behavior here would overwrite a *different* file's canonical name with
+        # this variant's content instead (see `_render_table_with_download`).
+        save_exports = not active_variant_label
+        if features_table is not None and raw_hits_available:
+            view = st.radio(
+                "View", ["Features (collapsed)", "Raw hits"], horizontal=True, key="cmp_view",
+            )
+        elif features_table is not None:
+            view = "Features (collapsed)"
+        else:
+            view = "Raw hits"
 
-    if view == "Features (collapsed)":
-        st.metric("Features", len(features_table))
-        _render_table_with_download(features_table, "apex_relative_intensity", "candidate_features", save=save_exports)
-        _render_acetyl_cooccurring_export(features_table, "apex_relative_intensity", "candidate_features", save=save_exports)
-        rt_col, mass_col, intensity_col = "apex_rt_minutes", "product_exact_mass", "apex_intensity"
-        feature_map_df = features_table
-    else:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total hits", len(candidate_table))
-        c2.metric("Distinct products", candidate_table["product_inchikey"].nunique())
-        c3.metric("Distinct parent compounds", candidate_table["parent_inchikey"].nunique())
-        if "acetyl_cooccurs" in candidate_table and candidate_table["acetyl_cooccurs"].notna().any():
-            st.metric("Hits with acetyl co-occurrence", int(candidate_table["acetyl_cooccurs"].sum()))
-        _render_table_with_download(candidate_table, "relative_intensity", "candidate_table", save=save_exports)
-        _render_acetyl_cooccurring_export(candidate_table, "relative_intensity", "candidate_table", save=save_exports)
-        rt_col, mass_col, intensity_col = "rt_minutes", "matched_mz", "intensity"
-        feature_map_df = candidate_table
+        if view == "Features (collapsed)":
+            st.metric("Features", len(features_table))
+            _render_table_with_download(features_table, "apex_relative_intensity", "candidate_features", save=save_exports)
+            _render_acetyl_cooccurring_export(features_table, "apex_relative_intensity", "candidate_features", save=save_exports)
+            rt_col, mass_col, intensity_col = "apex_rt_minutes", "product_exact_mass", "apex_intensity"
+            feature_map_df = features_table
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total hits", len(candidate_table))
+            c2.metric("Distinct products", candidate_table["product_inchikey"].nunique())
+            c3.metric("Distinct parent compounds", candidate_table["parent_inchikey"].nunique())
+            if "acetyl_cooccurs" in candidate_table and candidate_table["acetyl_cooccurs"].notna().any():
+                st.metric("Hits with acetyl co-occurrence", int(candidate_table["acetyl_cooccurs"].sum()))
+            _render_table_with_download(candidate_table, "relative_intensity", "candidate_table", save=save_exports)
+            _render_acetyl_cooccurring_export(candidate_table, "relative_intensity", "candidate_table", save=save_exports)
+            rt_col, mass_col, intensity_col = "rt_minutes", "matched_mz", "intensity"
+            feature_map_df = candidate_table
 
-    st.divider()
-    st.subheader("Feature map")
-    _render_feature_map(feature_map_df, rt_col, mass_col, intensity_col)
-    plotting.save_feature_map_figure(feature_map_df, rt_col, mass_col, intensity_col,
-                                      os.path.join(_FIGURES_DIR, "feature_map.png"))
-    st.caption(f"Figures saved to `{_FIGURES_DIR}`")
+        st.html('<div class="sub-header">FEATURE MAP</div>')
+        st.divider()
+        st.subheader("Feature map")
+        _render_feature_map(feature_map_df, rt_col, mass_col, intensity_col)
+        plotting.save_feature_map_figure(feature_map_df, rt_col, mass_col, intensity_col,
+                                          os.path.join(_FIGURES_DIR, "feature_map.png"))
+        st.caption(f"Figures saved to `{_FIGURES_DIR}`")
 
 
 def _render_ms2_filter_settings():

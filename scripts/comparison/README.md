@@ -201,6 +201,33 @@ genuine nearby MS2 scan, and a real fragment peak from that scan was
 correctly flagged as a diagnostic-ion match while an arbitrary absent mass
 was correctly not.
 
+## GUI layout, "Lock Calibration", and pipeline status
+
+The page is built from four bordered sheets (LOAD / PARAMETERS / RUN /
+ANALYZE, `common.ui`'s shared sheet convention -- see `scripts/README.md`).
+If no suspect library file exists yet, only LOAD renders (a placeholder
+warning in place of the usual library metrics); PARAMETERS/RUN/ANALYZE
+aren't instantiated at all in that case, same hard-stop behavior as before
+the redesign, just reskinned.
+
+**"Lock Calibration"** (in PARAMETERS, after "Optional filters") is new: a
+settings-review gate, not just cosmetic. Clicking it snapshots every
+current match/MS2 setting (including the diagnostic-ion targets' own
+"use in filter" state, curated on a *different* page); changing any one of
+them afterward -- including editing a target on the mzML Scan Detector page
+-- auto-clears the lock on the next render, so it can't silently go stale.
+Exists specifically to give the pipeline stepper's "CALIBRATE MATCH" stage
+an honest completion signal; there was no equivalent step before it.
+
+Two small, pure, side-effect-free functions -- `calibrate_status()` (is the
+lock currently held) and `execute_match_status()` (does a non-empty match
+result exist) -- feed the pipeline stepper in `main.py`. `_populate_result_session_state`
+(the one choke point every fresh match *and* every loaded saved/variant
+result already funnels through) also resets Molecule Explorer's own
+`explorer_reviewed`/`explorer_last_result_empty` flags -- new data must
+never inherit a stale "already reviewed" signal from whatever was loaded
+before it.
+
 ## Folders
 - `data/` — module-local scratch input (gitignored); the suspect library it
   reads lives in `insilico_library/data/`, not here.

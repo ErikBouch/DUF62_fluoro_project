@@ -13,6 +13,7 @@ GUI only: no science logic of its own.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 
@@ -20,8 +21,9 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.ui import (  # noqa: E402
-    SHARED_CANDIDATE_TABLE_KEY, SHARED_LIBRARY_PATH_KEY, SHARED_MZML_KEY, SHARED_SUSPECT_LIBRARY_KEY,
-    page_header, persist, pick_mzml_files, resolved_shared_mzml_files, restore,
+    PIPELINE_ORDER, SHARED_CANDIDATE_TABLE_KEY, SHARED_LIBRARY_PATH_KEY, SHARED_MZML_KEY,
+    SHARED_SUSPECT_LIBRARY_KEY, STAGE_GLYPH, STAGE_LABELS, STATUS_COLOR_VAR,
+    mount_key, page_header, persist, pick_mzml_files, resolved_shared_mzml_files, restore,
 )
 
 _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +42,19 @@ _MODULES = [
      "sortable, paginated gallery."),
 ]
 
+# The other 4 modules' own pure pipeline-stage status functions, keyed by the
+# stage they own. Looked up lazily (module name + attribute name, not a
+# direct import) because those modules are being migrated onto this same
+# visual system in parallel, right now, in separate files -- see
+# `_stage_status_and_text()`.
+_EXTERNAL_STATUS_FUNCS = {
+    "lib_normalize": ("insilico_library.gui", "normalize_status"),
+    "lib_build_suspects": ("insilico_library.gui", "build_status"),
+    "calibrate_match": ("comparison.gui", "calibrate_status"),
+    "execute_match": ("comparison.gui", "execute_match_status"),
+    "review_output": ("explorer.gui", "review_output_status"),
+}
+
 
 def _render_module_map():
     st.subheader("What each page does")
@@ -57,6 +72,19 @@ def _render_mzml_picker():
     pick_mzml_files(key=SHARED_MZML_KEY)
 
 
+def _library_file_status(path: str) -> str:
+    """
+    Single source of truth for a library path's status -- 'todo' if no path
+    is set at all, 'failed' if a path is set but no file exists there, 'done'
+    if it points at a real file. Shared by `_render_library_picker`'s inline
+    warning/success and the pure `link_library_status()` pipeline check below,
+    so the "does this path exist" rule is defined exactly once.
+    """
+    if not path:
+        return "todo"
+    return "done" if os.path.isfile(path) else "failed"
+
+
 def _render_library_picker():
     st.subheader("Library")
     st.caption(
@@ -72,9 +100,10 @@ def _render_library_picker():
     persist(SHARED_LIBRARY_PATH_KEY)
 
     library_path = st.session_state.get(SHARED_LIBRARY_PATH_KEY, "")
-    if library_path and not os.path.isfile(library_path):
+    status = _library_file_status(library_path)
+    if status == "failed":
         st.warning(f"No file found at `{library_path}`.")
-    elif library_path:
+    elif status == "done":
         st.success(f"Found `{library_path}` — map its columns on the In-silico Library page.")
 
 
@@ -124,31 +153,64 @@ def _render_results():
     )
 
 
+def acquire_data_status() -> str:
+    """'done' if resolved_shared_mzml_files() is non-empty, else 'todo'. Pure,
+    side-effect-free -- read by main.py's pipeline stepper on every rerun,
+    regardless of which page is currently showing."""
+    return "done" if resolved_shared_mzml_files() else "todo"
+
+
+def link_library_status() -> str:
+    """'done' if the shared library path is set and os.path.isfile() is True,
+    'failed' if a path is set but the file doesn't exist, else 'todo'. Pure,
+    side-effect-free -- read by main.py's pipeline stepper on every rerun,
+    regardless of which page is currently showing."""
+    return _library_file_status(st.session_state.get(SHARED_LIBRARY_PATH_KEY, ""))
+
+
+def _stage_status_and_text() -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Live status (+ any display-text override) for all 7 pipeline stages, for
+    the STATUS sheet's ledger. `acquire_data`/`link_library` are this
+    module's own; the other 5 belong to the other 4 modules, which are being
+    migrated onto this same visual system in parallel right now -- looked up
+    lazily and wrapped in try/except so a status function that doesn't exist
+    yet (AttributeError) or a module that doesn't import cleanly yet
+    (ImportError) shows as a "PENDING MIGRATION" placeholder row here instead
+    of crashing this page. Left in as permanent belt-and-suspenders rather
+    than torn out once every module has landed: at that point the try simply
+    always succeeds, so this stays harmless instead of turning into dead code
+    that needs removing.
+    """
+    status = {"acquire_data": acquire_data_status(), "link_library": link_library_status()}
+    text_overrides: dict[str, str] = {}
+    for stage_key, (module_name, func_name) in _EXTERNAL_STATUS_FUNCS.items():
+        try:
+            module = importlib.import_module(module_name)
+            status[stage_key] = getattr(module, func_name)()
+        except (ImportError, AttributeError):
+            status[stage_key] = "todo"
+            text_overrides[stage_key] = "PENDING MIGRATION"
+    return status, text_overrides
+
+
 def _render_status():
-    # `restore()` first on both keys, same as `_render_result_path()` above
-    # -- correct today only because that function happens to run earlier in
-    # `render()`'s fixed call order and restores these same keys itself;
-    # reading them directly here would silently come back empty if this
-    # function were ever called before that one (e.g. a future reordering),
-    # same class of bug as the shared mzML/library-path keys elsewhere.
     st.subheader("Status")
-    n_files = len(resolved_shared_mzml_files())
-    c1, c2, c3 = st.columns(3)
-    c1.metric("mzML files selected", n_files)
-
-    restore(SHARED_SUSPECT_LIBRARY_KEY, _DEFAULT_SUSPECT_LIBRARY_PATH if os.path.isfile(_DEFAULT_SUSPECT_LIBRARY_PATH) else "")
-    library_path = st.session_state.get(SHARED_SUSPECT_LIBRARY_KEY, "")
-    if library_path and os.path.isfile(library_path):
-        c2.metric("Suspect library", "ready to auto-load")
-    else:
-        c2.metric("Suspect library", "not set")
-
-    restore(SHARED_CANDIDATE_TABLE_KEY, _DEFAULT_CANDIDATE_TABLE_PATH if os.path.isfile(_DEFAULT_CANDIDATE_TABLE_PATH) else "")
-    candidate_path = st.session_state.get(SHARED_CANDIDATE_TABLE_KEY, "")
-    if candidate_path and os.path.isfile(candidate_path):
-        c3.metric("MS Matching result", "ready to auto-load")
-    else:
-        c3.metric("MS Matching result", "not set")
+    status, text_overrides = _stage_status_and_text()
+    rows = []
+    for stage_key in PIPELINE_ORDER:
+        stage_status = status[stage_key]
+        color = STATUS_COLOR_VAR[stage_status]
+        glyph = STAGE_GLYPH[stage_status]
+        status_text = text_overrides.get(stage_key, stage_status.upper())
+        rows.append(
+            '<div class="status-row">'
+            f'<span class="status-glyph" style="color:{color}">{glyph}</span>'
+            f'<span class="status-label">{STAGE_LABELS[stage_key]}</span>'
+            f'<span class="status-text" style="color:{color}">{status_text}</span>'
+            "</div>"
+        )
+    st.html("\n".join(rows))
 
 
 def render():
@@ -158,11 +220,15 @@ def render():
         "page does. Every other page starts from the same selection by default.",
     )
     _render_module_map()
-    st.divider()
-    _render_mzml_picker()
-    st.divider()
-    _render_library_picker()
-    st.divider()
-    _render_results()
-    st.divider()
-    _render_status()
+
+    with st.container(key=mount_key("sheet_setup_files", "sheet_setup_files_entered")):
+        _render_mzml_picker()
+
+    with st.container(key=mount_key("sheet_setup_library", "sheet_setup_library_entered")):
+        _render_library_picker()
+
+    with st.container(key=mount_key("sheet_setup_results", "sheet_setup_results_entered")):
+        _render_results()
+
+    with st.container(key=mount_key("sheet_setup_status", "sheet_setup_status_entered")):
+        _render_status()

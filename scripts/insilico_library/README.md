@@ -208,6 +208,27 @@ fluoroacetyl + 4 acetyl product rows (one simple amino acid's single site +
 a symmetric diamine's single *distinct* product despite two reactive ends +
 lysine's two independent alpha/epsilon sites).
 
+## GUI layout and pipeline status
+
+**Load existing library** shows two display-only sheets (Normalized
+Library, Suspect Library -- `common.ui`'s shared sheet convention, see
+`scripts/README.md`), no run controls. **Generate a new library** shows
+three (Source, Normalize, Build) -- each stage's action button and its own
+conditional result block share one sheet rather than being split into a
+separate run box and an analyze box, since the underlying code already has
+zero visual separation between the two.
+
+Two small, pure, side-effect-free functions -- `normalize_status()` and
+`build_status()` -- feed the pipeline stepper in `main.py`. Both reuse the
+same file-validity checks the display functions already had (extracted so
+there's exactly one place that decides "is this file actually a valid
+normalized library / suspect library", not two that could drift). A fresh
+Normalize run that parses 0 rows now also sets a session-only
+`insilico_normalize_last_run_failed` flag (cleared on the next successful
+run) -- without it, that failure was only ever an `st.error` on screen, with
+no way for the stepper to know a fresh run had actually failed rather than
+just not having run yet.
+
 ## Folders
 - `data/` — genuinely raw/example input only: the DNP+LOTUS+HMDB merge
   (`unified_structures.parquet` + a plain `.csv` copy), produced by
