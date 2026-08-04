@@ -39,6 +39,15 @@ from common.ui import preset_controls  # noqa: E402
 def _setup_page():
     import setup.gui as gui
 
+    # The app-level title/caption only makes sense once, on the landing
+    # page -- every other page already has its own `page_header()` title,
+    # so repeating this banner above it on all five pages was pure
+    # redundancy.
+    st.title("DUF62 Fluoro Project")
+    st.caption(
+        "Finding naturally fluoroacetylated plant metabolites via an in-silico "
+        "suspect library matched against LC-HRMS data."
+    )
     gui.render()
 
 
@@ -66,12 +75,6 @@ def _explorer_page():
     gui.render()
 
 
-st.title("DUF62 Fluoro Project")
-st.caption(
-    "Finding naturally fluoroacetylated plant metabolites via an in-silico "
-    "suspect library matched against LC-HRMS data."
-)
-
 # Streamlit's top-right "running" indicator has a fixed, non-configurable
 # icon (an animated running-man SVG) -- there's no config/theme/API option
 # to change it. This hides just that icon via its internal data-testid,
@@ -79,6 +82,23 @@ st.caption(
 # match) untouched. Depends on Streamlit's current internal markup, not a
 # public API -- may need updating if a Streamlit upgrade renames it.
 st.html("<style>[data-testid='stStatusWidgetRunningIcon'] { display: none; }</style>")
+
+# No native `st.set_page_config`/theme option controls the sidebar's pixel
+# width (only open/collapsed state) -- CSS is the only lever. Streamlit's own
+# default range is a *fixed*, non-relative `min-width: 200px; max-width:
+# 600px` -- overridden here with a percentage range instead, so the sidebar
+# actually scales with screen width, and drag-resizing still works anywhere
+# inside that range. Deliberately NOT setting `width` itself (an earlier
+# version did, pinned to an exact px value): that fought every drag attempt
+# -- Streamlit's own resize handler sets `width` as an inline style on each
+# drag move, and a `width: ... !important` rule here would silently snap it
+# straight back, making the sidebar look frozen/unmovable. Leaving `width`
+# alone lets Streamlit's own current/dragged value stand; only the outer
+# min/max range is widened.
+st.html(
+    "<style>[data-testid='stSidebar'] { min-width: 10% !important; "
+    "max-width: 20% !important; }</style>"
+)
 
 with st.sidebar:
     preset_controls()

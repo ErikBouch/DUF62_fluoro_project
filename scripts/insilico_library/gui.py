@@ -7,19 +7,27 @@ GUI only: all science logic lives in db_loader.py / acylation.py /
 build_suspect_library.py so it stays testable and usable from the CLI without
 Streamlit installed.
 
-Two stages, matching the two on-disk artifacts under output/ (both computed
-results, not input data):
-1. Normalize -- read the raw library (any table with a structure column,
-   mapped by the user below), compute inchikey/formula for every row via
-   RDKit (never trusted from the source file -- see db_loader.py's
-   `load_user_table`) -> output/normalized_library.parquet. Deliberately
-   NOT computed/stored here: has_primary_amine and exact_mass -- neither is
-   something a source database supplies, so (like db_loader.py's own merged
-   table) this stays a plain structure table; both are computed fresh, right
-   where they're actually used, below.
-2. Build -- compute has_primary_amine for that normalized table, run the
-   acylation reactions over the compounds that have one -> output/
-   suspect_library.parquet (+ multidegree).
+Two top-level workflows (a choice, not both shown at once -- see `render()`):
+- **Load existing library** -- just look at whatever's already on disk (or
+  wherever the Setup page points, for the suspect library). No analysis
+  runs here.
+- **Generate a new library** -- two stages, matching the two on-disk
+  artifacts under output/ (both computed results, not input data):
+  1. Normalize -- read the raw library (any table with a structure column,
+     mapped by the user), compute inchikey/formula for every row via RDKit
+     (never trusted from the source file -- see db_loader.py's
+     `load_user_table`) -> output/normalized_library.parquet. Deliberately
+     NOT computed/stored here: has_primary_amine and exact_mass -- neither
+     is something a source database supplies, so (like db_loader.py's own
+     merged table) this stays a plain structure table; both are computed
+     fresh, right where they're actually used, below.
+  2. Build -- compute has_primary_amine for that normalized table, run the
+     acylation reactions over the compounds that have one -> output/
+     suspect_library.parquet (+ multidegree).
+  Stats for a step only appear once *this session* has actually run it, not
+  just because a file happens to already exist on disk from an earlier
+  session -- that ambiguity (is this fresh or stale?) is exactly what the
+  two-workflow split above resolves.
 """
 from __future__ import annotations
 
@@ -33,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.run_log import append_run, render_run_log  # noqa: E402
 from common.ui import (  # noqa: E402
     SHARED_LIBRARY_PATH_KEY, SHARED_SUSPECT_LIBRARY_KEY,
-    notify_done, page_header, persist, render_last_notification, restore,
+    notify_done, page_header, persist, render_last_notification, restore, status_button,
 )
 
 _OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -52,8 +60,6 @@ def _cached_parquet(path: str, mtime: float):
     import pandas as pd
 
     return pd.read_parquet(path)
-
-
 
 
 @st.cache_data(show_spinner=False)
@@ -145,11 +151,22 @@ def _render_source_and_mapping():
 _NORMALIZED_REQUIRED_COLS = {"inchi", "source_db"}
 
 
-def _render_normalized_stats():
-    if not os.path.isfile(_NORMALIZED_PATH):
-        st.info("Not normalized yet.")
-        return None
+def _load_normalized():
+    """
+    Load+validate the current normalized table from disk, or `None` if it
+    doesn't exist yet. Shows an error + delete button if it exists but is
+    malformed (e.g. left over from a Normalize run that parsed 0 rows) --
+    worth surfacing regardless of which workflow is active below, since a
+    broken file blocks both "load existing" and Build (which reads this same
+    file in "generate a new one").
 
+    Deliberately separate from displaying its stats (`_render_normalized_stats`):
+    Build needs to know whether a usable normalized table exists regardless
+    of whether its metrics are currently being shown, and the two workflows
+    below show those metrics under different conditions.
+    """
+    if not os.path.isfile(_NORMALIZED_PATH):
+        return None
     normalized = _cached_parquet(_NORMALIZED_PATH, os.path.getmtime(_NORMALIZED_PATH))
     missing = _NORMALIZED_REQUIRED_COLS - set(normalized.columns)
     if missing:
@@ -157,14 +174,17 @@ def _render_normalized_stats():
             f"`{os.path.basename(_NORMALIZED_PATH)}` is missing expected column(s) "
             f"({', '.join(sorted(missing))}) -- most likely left over from a normalize run "
             "that parsed 0 rows (e.g. the wrong structure column was picked). Delete it and "
-            "normalize again above."
+            "normalize again."
         )
-        if st.button("Delete this file"):
+        if st.button("Delete this file", key="insilico_delete_malformed"):
             os.remove(_NORMALIZED_PATH)
             st.cache_data.clear()
             st.rerun()
         return None
+    return normalized
 
+
+def _render_normalized_stats(normalized):
     # No reactive-functional-group count shown here on purpose: it used to be
     # recomputed live on every page render (a real RDKit pass over every row,
     # minutes on a real library, just to display a number), and it hardcoded
@@ -175,23 +195,24 @@ def _render_normalized_stats():
     c1, c2 = st.columns(2)
     c1.metric("Unique structures", len(normalized))
     c2.metric("Sources", normalized["source_db"].str.split(",").explode().nunique())
-    return normalized
 
 
 def _resolve_suspect_library_path() -> str:
     """
-    The suspect library shown below: whatever's set on the Setup page (a
-    result from a previous run, possibly saved somewhere else), falling back
-    to this module's own standard build location -- so pointing Setup at a
-    different file shows *that* file's stats here too, not just whatever
-    happens to sit at the fixed default path.
+    Whatever suspect library is set on the Setup page (a result from a
+    previous run, possibly saved somewhere else), falling back to this
+    module's own standard build location -- used by the "load existing"
+    workflow, so pointing Setup at a different file shows *that* file's
+    stats there too, not just whatever happens to sit at the fixed default
+    path. NOT used right after a fresh Build in "generate a new one" below
+    -- that always shows the file it just wrote, at the fixed default path,
+    regardless of what Setup happens to point at.
     """
     restore(SHARED_SUSPECT_LIBRARY_KEY, _SUSPECT_MONO_PATH if os.path.isfile(_SUSPECT_MONO_PATH) else "")
     return st.session_state.get(SHARED_SUSPECT_LIBRARY_KEY, "") or _SUSPECT_MONO_PATH
 
 
-def _render_suspect_library_stats():
-    path = _resolve_suspect_library_path()
+def _render_suspect_library_stats(path: str):
     if not os.path.isfile(path):
         st.info("Suspect library not built yet.")
         return
@@ -208,13 +229,41 @@ def _render_suspect_library_stats():
     st.dataframe(mono.head(50), width="stretch")
 
 
-def render():
-    page_header(
-        "In-silico Library",
-        "Turn a library of candidate compounds into the acetyl/fluoroacetyl suspect library "
-        "used for matching.",
-    )
+def _render_load_existing_workflow():
+    """
+    Workflow 1: just look at whatever's already on disk (or wherever the
+    Setup page points, for the suspect library). No analysis runs here --
+    this is deliberately the *only* place stats show for a result that
+    wasn't just computed in this session, so opening the page never mixes
+    "here's what you just built" with "here's some possibly-stale leftover
+    from a previous run" the way the single unconditional view used to.
+    """
+    st.subheader("Normalized library")
+    normalized = _load_normalized()
+    if normalized is None:
+        st.caption("No normalized library found yet.")
+    else:
+        _render_normalized_stats(normalized)
+        render_run_log(_OUTPUT_DIR, title="Normalize run history", filename=_NORMALIZE_RUN_LOG)
 
+    st.divider()
+    st.subheader("Suspect library")
+    _render_suspect_library_stats(_resolve_suspect_library_path())
+    render_run_log(_OUTPUT_DIR, title="Build run history", filename=_BUILD_RUN_LOG)
+
+
+def _render_generate_workflow():
+    """
+    Workflow 2: map a source library and actually run Normalize/Build.
+    Stats only appear here once *this session* has actually run the
+    corresponding step (`insilico_just_normalized`/`insilico_just_built`,
+    plain session_state flags set right after each run succeeds) -- not
+    just because a file happens to already exist on disk from some earlier
+    session. Readiness checks (can Build even run) still look at disk
+    directly regardless of that flag, since Build needs to know whether a
+    real normalized table exists, not whether *this* session is the one that
+    produced it.
+    """
     mapping = _render_source_and_mapping()
 
     st.divider()
@@ -222,7 +271,12 @@ def render():
     st.caption(
         "Computes inchikey/formula for every row via RDKit, deduplicated by structure (InChIKey)."
     )
-    if mapping is not None and st.button("Normalize library", type="primary"):
+    normalize_ready = mapping is not None
+    normalize_status = (
+        "Possible -- will parse and deduplicate the mapped column(s) above."
+        if normalize_ready else "Not possible yet -- map a structure column above first."
+    )
+    if status_button("Normalize library", "insilico_btn_normalize", normalize_ready, normalize_status):
         raw, inchi_col, smiles_col, name_col, organism_col, source_label = mapping
         from insilico_library.db_loader import load_user_table, merge_rows
 
@@ -260,6 +314,7 @@ def render():
                 "n_unique_structures": len(normalized),
                 "duration_seconds": round(time.time() - t0, 1),
             }, filename=_NORMALIZE_RUN_LOG)
+            st.session_state["insilico_just_normalized"] = True
             notify_done(
                 "insilico_normalize",
                 f"Parsed {stats.n_parsed_ok}/{stats.n_records_seen} rows ok "
@@ -267,18 +322,28 @@ def render():
             )
 
     render_last_notification("insilico_normalize")
-    normalized = _render_normalized_stats()
-    render_run_log(_OUTPUT_DIR, title="Normalize run history", filename=_NORMALIZE_RUN_LOG)
+    if st.session_state.get("insilico_just_normalized"):
+        just_normalized = _load_normalized()
+        if just_normalized is not None:
+            _render_normalized_stats(just_normalized)
+        render_run_log(_OUTPUT_DIR, title="Normalize run history", filename=_NORMALIZE_RUN_LOG)
 
     st.divider()
     st.subheader("2. Build suspect library")
     st.caption("Runs the acetyl/fluoroacetyl acylation reactions over every normalized, primary-amine-bearing compound.")
 
-    if normalized is not None and st.button("Build suspect library", type="primary"):
+    normalized_for_build = _load_normalized()
+    build_ready = normalized_for_build is not None
+    build_status = (
+        f"Possible -- {len(normalized_for_build)} unique structures ready to react." if build_ready
+        else "Not possible yet -- normalize a library above first."
+    )
+    if status_button("Build suspect library", "insilico_btn_build", build_ready, build_status):
         from insilico_library.acylation import REACTIVE_GROUP_LABEL
         from insilico_library.build_suspect_library import build_library
         from insilico_library.db_loader import compute_exact_mass_series, compute_primary_amine_flags
 
+        normalized = normalized_for_build
         t0 = time.time()
         with st.spinner("Finding primary-amine-bearing structures..."):
             primary_amine_df = normalized[compute_primary_amine_flags(normalized["inchi"])].reset_index(drop=True)
@@ -313,6 +378,7 @@ def render():
             "n_errors": n_errors,
             "duration_seconds": round(time.time() - t0, 1),
         }, filename=_BUILD_RUN_LOG)
+        st.session_state["insilico_just_built"] = True
         notify_done(
             "insilico_build",
             f"{n_processed} compounds processed, {len(mono_df)} product rows "
@@ -320,5 +386,42 @@ def render():
         )
 
     render_last_notification("insilico_build")
-    _render_suspect_library_stats()
-    render_run_log(_OUTPUT_DIR, title="Build run history", filename=_BUILD_RUN_LOG)
+    if st.session_state.get("insilico_just_built"):
+        _render_suspect_library_stats(_SUSPECT_MONO_PATH)
+        render_run_log(_OUTPUT_DIR, title="Build run history", filename=_BUILD_RUN_LOG)
+
+
+def render():
+    page_header(
+        "In-silico Library",
+        "Turn a library of candidate compounds into the acetyl/fluoroacetyl suspect library "
+        "used for matching.",
+    )
+
+    load_ready = os.path.isfile(_NORMALIZED_PATH) or os.path.isfile(_resolve_suspect_library_path())
+    load_status = (
+        "Possible -- a previously generated library is on disk." if load_ready
+        else "Not possible yet -- nothing generated yet; use \"Generate a new library\" instead."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if status_button("Load existing library", "insilico_btn_workflow_load", load_ready, load_status):
+            st.session_state["insilico_workflow"] = "load"
+    with col2:
+        if status_button(
+            "Generate a new library", "insilico_btn_workflow_generate", True,
+            "Always possible -- map a source library below.",
+        ):
+            st.session_state["insilico_workflow"] = "generate"
+
+    workflow = st.session_state.get("insilico_workflow")
+    if workflow is None:
+        st.info("Choose an option above to get started.")
+        return
+
+    st.divider()
+    if workflow == "load":
+        _render_load_existing_workflow()
+    else:
+        _render_generate_workflow()

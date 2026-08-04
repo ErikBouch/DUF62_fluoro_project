@@ -17,7 +17,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from comparison import plotting  # noqa: E402
 from comparison.matcher import isomers_for_formula, structures_by_formula  # noqa: E402
-from common.ui import persist, resolved_shared_mzml_files, restore  # noqa: E402
+from common.ui import persist, resolved_shared_mzml_files, restore, status_button  # noqa: E402
 from explorer.gallery import DEFAULT_SORT, PAGE_SIZE, SORT_OPTIONS, paginate, sort_structures  # noqa: E402
 
 # Reused directly from comparison/gui.py rather than duplicated: Molecule
@@ -161,24 +161,24 @@ def _render_show_current_results():
     to `comparison/output/candidate_table.parquet`), so pointing the Setup
     page at a different saved result changes what this offers too.
 
-    Button first, status line right under it -- computed on every render
-    with no click needed, so "is this even possible right now" is always the
-    immediate answer, not something you find out only after pressing.
+    Status computed on every render with no click needed, so "is this even
+    possible right now" is always the immediate answer, not something you
+    find out only after pressing.
     """
     saved = _find_saved_result()
     ready = saved is not None
-    if st.button("Show current results", key="explorer_btn_default", disabled=not ready):
-        with st.spinner("Loading saved result from disk..."):
-            _load_saved_result(saved)
-        st.rerun()
-
     if ready:
         import datetime
 
         saved_when = datetime.datetime.fromtimestamp(saved["table_mtime"]).strftime("%Y-%m-%d %H:%M")
-        st.caption(f"Possible -- found `{saved['table_path']}` (saved {saved_when}).")
+        status = f"Possible -- found a result saved {saved_when}."
     else:
-        st.caption(f"Not possible yet -- no saved result found at the default location (`{_COMPARISON_OUTPUT_DIR}`).")
+        status = f"Not possible yet -- no saved result found at the default location (`{_COMPARISON_OUTPUT_DIR}`)."
+
+    if status_button("Show current results", "explorer_btn_default", ready, status):
+        with st.spinner("Loading saved result from disk..."):
+            _load_saved_result(saved)
+        st.rerun()
 
 
 def _render_load_from_path_form():
@@ -233,13 +233,11 @@ def _render_load_from_path():
     text box and dropdown sitting on the page permanently, which is exactly
     the "everything visible at once" clutter this redesign is fixing.
     """
-    show = st.session_state.get("explorer_show_custom_path_form", False)
-    if st.button("Load from a folder or file", key="explorer_btn_custom_toggle"):
-        show = not show
-        st.session_state["explorer_show_custom_path_form"] = show
-    st.caption("Always possible -- point at any folder or a specific result file.")
-    if show:
-        _render_load_from_path_form()
+    status = "Always possible -- point at any folder or a specific result file."
+    if status_button("Load from a folder or file", "explorer_btn_custom_toggle", True, status):
+        st.session_state["explorer_show_custom_path_form"] = not st.session_state.get(
+            "explorer_show_custom_path_form", False,
+        )
 
 
 def _render_run_missing():
@@ -249,8 +247,7 @@ def _render_run_missing():
     without further user input (a match, against the existing suspect
     library + selected mzML files) -- Normalize needs the user's own column
     mapping, so a missing suspect library is reported, not silently
-    guessed. Button first (disabled when not possible), status line right
-    under it explaining why, same pattern as the other two options.
+    guessed.
     """
     library_path = _resolve_library_path()
     file_paths = resolved_shared_mzml_files()
@@ -262,30 +259,42 @@ def _render_run_missing():
         missing.append("no mzML files selected (pick some on Setup)")
     ready = not missing
 
-    if st.button("Run match now", key="explorer_btn_run", disabled=not ready, type="primary" if ready else "secondary"):
+    status = (
+        f"Possible -- suspect library + {len(file_paths)} mzML file(s) found. Runs with whatever "
+        "filter settings are currently set on the MS Matching page (or their defaults)."
+        if ready else "Not possible yet -- " + "; ".join(missing) + "."
+    )
+
+    if status_button("Run match now", "explorer_btn_run", ready, status):
         library = _cached_library(library_path, os.path.getmtime(library_path))
         with st.spinner("Running match..."):
             candidate_table = _run_match(library, file_paths)
         st.success(f"Match finished -- {len(candidate_table)} raw hits across {len(file_paths)} file(s).")
         st.rerun()
 
-    if ready:
-        st.caption(
-            f"Possible -- suspect library + {len(file_paths)} mzML file(s) found. Runs with whatever "
-            "filter settings are currently set on the MS Matching page (or their defaults)."
-        )
-    else:
-        st.caption("Not possible yet -- " + "; ".join(missing) + ".")
-
 
 def _render_data_loader():
+    """
+    Three big, color-coded buttons side by side (using the page's full width
+    -- there's no reason to stack them narrowly when there's horizontal room
+    to spare), each with its own always-computed status line. Only once one
+    of them is actually engaged (a load happens, or option 2's own path
+    picker is toggled open) does anything else on the page appear -- nothing
+    sits here permanently just in case it's needed.
+    """
     st.info("No data loaded yet.")
 
-    _render_show_current_results()
-    st.divider()
-    _render_load_from_path()
-    st.divider()
-    _render_run_missing()
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        _render_show_current_results()
+    with col2:
+        _render_load_from_path()
+    with col3:
+        _render_run_missing()
+
+    if st.session_state.get("explorer_show_custom_path_form", False):
+        st.divider()
+        _render_load_from_path_form()
 
 
 def render():

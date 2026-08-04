@@ -10,14 +10,16 @@ Four things:
    user isn't left guessing what "MS Matching" vs. "In-silico Library" means
    before trying either.
 2. **Shared mzML file picker** -- the same `common.ui.pick_mzml_files` every
-   other page uses, under `common.ui.SHARED_MZML_KEY`. Picking files here
-   seeds the *default* selection on every other page (mzML Scan Detector, MS
-   Matching) via `pick_mzml_files`'s `default` param -- each page still has
-   its own independent, still-editable selection, so choosing a different
-   file later on one page never changes what another page uses. mzML
-   discovery itself looks under `<repo root>/data/mzml/` (gitignored) --
-   a real, repo-relative default any clone can use, not a path that only
-   makes sense on one specific machine.
+   other page uses, under `common.ui.SHARED_MZML_KEY`: one text area of full
+   file paths, one per line. Picking files here seeds the *default*
+   selection on every other page (mzML Scan Detector, MS Matching) via
+   `pick_mzml_files`'s `default` param -- each page still has its own
+   independent, still-editable selection, so choosing a different file later
+   on one page never changes what another page uses. (An earlier version
+   also offered a multiselect over files auto-discovered under
+   `<repo root>/data/mzml/` -- dropped since real data always lives outside
+   the repo in practice, making that half unused; `common.ui.find_mzml_files`
+   still exists for the CLI scripts that use it directly.)
 3. **Shared library file path** -- a text input (`common.ui.SHARED_LIBRARY_PATH_KEY`)
    pointing at any CSV/Parquet library file, plus an explanation of the
    minimal format In-silico Library's column mapping expects (a structure
@@ -44,22 +46,22 @@ this page is unmounted, same as any other widget. Reading them directly from
 silently returns nothing from any other page until `restore()` pulls the
 persisted value back in.
 
-**The mzML list is two widgets, not one -- reading only the multiselect's own
-session_state silently drops anything entered as a custom path.**
-`SHARED_MZML_KEY` is only the multiselect half of `pick_mzml_files`; the
-custom-paths text area is a second, separate key
-(`f"{SHARED_MZML_KEY}_custom"`). A real bug shipped briefly because of this:
-downstream pages seeded their default from
-`st.session_state.get(SHARED_MZML_KEY)` alone, so any file entered as a
-custom path (exactly how a private data folder outside `data/mzml/` gets in)
-never propagated anywhere, even though it displayed correctly on Setup's own
-page. Fixed with `common.ui.resolved_shared_mzml_files()`, which combines
-both halves *and* reads the persisted settings store directly rather than
-`st.session_state` -- robust even when a preset is loaded from the sidebar
-while a different page is active, since the sidebar's preset controls are
-reachable from every page, not just Setup's own. Every reader of the shared
-mzML selection (Setup's own status count, mzML Scan Detector, MS Matching)
-now goes through this one function instead of reading the raw key.
+**The mzML list used to be two widgets, not one -- reading only the
+multiselect's own session_state silently dropped anything entered as a
+custom path.** `SHARED_MZML_KEY` was only the multiselect half of
+`pick_mzml_files`; the custom-paths text area was a second, separate key. A
+real bug shipped briefly because of this: downstream pages seeded their
+default from `st.session_state.get(SHARED_MZML_KEY)` alone, so any file
+entered as a custom path (exactly how a private data folder outside
+`data/mzml/` gets in) never propagated anywhere, even though it displayed
+correctly on Setup's own page. Fixed at the time by combining both halves in
+`common.ui.resolved_shared_mzml_files()`; later made structurally impossible
+by dropping the multiselect half entirely, so there's only ever been one key
+to read since. `resolved_shared_mzml_files()` still reads the persisted
+settings store directly rather than `st.session_state`, though -- robust even
+when a preset is loaded from the sidebar while a different page is active,
+since the sidebar's preset controls are reachable from every page, not just
+Setup's own.
 
 **A value that was never wired into `restore`/`persist` at all doesn't save
 with a preset, full stop -- not just a cross-page read problem.** The mzML
@@ -78,11 +80,9 @@ piece of state: does it actually flow through `restore`/`persist`, or does it
 just look like it does because it happens to survive within one session?
 
 ## Status
-Built and live-tested end-to-end, including the exact failure mode a real
-saved preset hit (files entered as custom paths, not the discovered-file
-multiselect): module descriptions render; the mzML selection -- multiselect
-*and* custom paths -- correctly seeds mzML Scan Detector's and MS Matching's
-own pickers across a real page navigation; the library path survives
-navigating to In-silico Library the same way; MS Matching auto-loads a saved
-result with no click; and the status panel correctly reflects a real built
-suspect library / saved match result.
+Built and live-tested end-to-end: module descriptions render; the mzML
+selection correctly seeds mzML Scan Detector's and MS Matching's own pickers
+across a real page navigation; the library path survives navigating to
+In-silico Library the same way; MS Matching auto-loads a saved result with no
+click; and the status panel correctly reflects a real built suspect library /
+saved match result.

@@ -1,13 +1,16 @@
 """
 common/ui.py — small shared helpers for the Streamlit GUI (not science logic).
 
-mzML file discovery looks under `<repo root>/data/mzml/` -- a real,
-repo-relative convention any clone can use (gitignored, empty by default),
-not a path that only makes sense on one specific machine. Used by more than
-one module (mzML Scan Detector *and* MS Matching), so it lives at the repo
-root's `data/`, not any one module's own `data/` folder. If it doesn't exist
-or is empty, file discovery simply comes back empty and the GUI falls back
-to manual path entry -- nothing breaks on a fresh clone.
+mzML file discovery (`find_mzml_files`, looking under `<repo root>/data/mzml/`
+-- a real, repo-relative convention any clone can use, gitignored, empty by
+default) is used directly by the CLI scripts (`comparison/run_match.py`,
+`insilico_library/benchmark_aa.py`). The GUI's own file picker
+(`pick_mzml_files`) does NOT use it -- it used to offer a multiselect over
+discovered files alongside a separate custom-paths box, but that discovery
+half went unused in practice (real data lives outside the repo, in a private
+folder, so every real session just typed/pasted custom paths anyway) and
+having two ways to do the same thing was confusing rather than convenient.
+The GUI picker is now just the one text area.
 """
 from __future__ import annotations
 
@@ -58,58 +61,36 @@ def find_mzml_files(root: str = DEFAULT_HRMS_DIR) -> list[tuple[str, str]]:
     return sorted(found, key=lambda pair: pair[0])
 
 
-def pick_mzml_files(root: str = DEFAULT_HRMS_DIR, key: str = "mzml_multiselect", default: list[str] | None = None) -> list[str]:
+def pick_mzml_files(key: str = "mzml_paths", default: list[str] | None = None) -> list[str]:
     """
-    Multi-file picker: a multiselect over discovered local mzML files, plus an
-    optional text area for additional custom paths (one per line).
+    File picker: one text area of full file paths, one per line. Used to
+    also offer a multiselect over files auto-discovered under `data/mzml/`
+    -- dropped since it went unused in practice (real data lives outside the
+    repo, in a private folder, so every real session just typed/pasted
+    custom paths anyway) and having two ways to do the same thing was
+    confusing, not convenient. `find_mzml_files`/`DEFAULT_HRMS_DIR` still
+    exist for the CLI scripts that use them directly.
 
-    `default`: full paths to pre-select the *first* time this widget is shown
+    `default`: full paths to pre-fill the *first* time this widget is shown
     (e.g. the Setup page's shared file selection, so every page starts from
-    the same files without being locked to it) -- pass `None`/omit for the
-    old behavior (starts empty). Only applies once; after that this picker's
-    own selection is tracked independently (`restore`/`persist`), so editing
-    it here never reaches back into the shared selection or any other page.
-    Paths matching a discovered file seed the multiselect; anything else
-    (e.g. a file outside `root`, or `root` not existing on this machine)
-    seeds the custom-paths text area instead -- a default is only useful if
-    both halves of a shared selection actually make it through, not just
-    whichever part happens to overlap with locally discovered files.
+    the same files without being locked to it) -- pass `None`/omit to start
+    empty. Only applies once; after that this picker's own text is tracked
+    independently (`restore`/`persist`), so editing it here never reaches
+    back into the shared selection or any other page.
 
-    Returns a list of full paths (discovered + custom, order not guaranteed).
+    Returns a list of full paths, one per non-blank line.
     """
     import streamlit as st
 
-    discovered = find_mzml_files(root)
-    labels = [label for label, _ in discovered]
-    by_label = dict(discovered)
-    path_to_label = {path: label for label, path in discovered}
-
-    default = default or []
-    default_labels = [path_to_label[p] for p in default if p in path_to_label]
-    default_custom = [p for p in default if p not in path_to_label]
-
-    restore(key, default_labels, valid_options=labels)
-    chosen_labels = st.multiselect("mzML files", labels, key=key)
+    restore(key, "\n".join(default or []))
+    text = st.text_area("mzML file paths (one per line)", key=key)
     persist(key)
-    custom_key = f"{key}_custom"
-    with st.expander("Add custom file paths (one per line)"):
-        restore(custom_key, "\n".join(default_custom))
-        custom_text = st.text_area("Custom paths", key=custom_key, label_visibility="collapsed")
-        persist(custom_key)
-    custom_paths = [line.strip() for line in custom_text.splitlines() if line.strip()]
-
-    return [by_label[label] for label in chosen_labels] + custom_paths
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def resolved_shared_mzml_files(root: str = DEFAULT_HRMS_DIR) -> list[str]:
+def resolved_shared_mzml_files() -> list[str]:
     """
-    The Setup page's shared mzML selection as full paths -- both halves,
-    discovered-file labels *and* custom-paths text, combined (mirroring
-    `pick_mzml_files`'s own return value). A real bug lived here: reading
-    just `st.session_state.get(SHARED_MZML_KEY)` (the multiselect's own
-    labels) silently dropped anything entered as a custom path, which is
-    exactly how any file outside `root` gets in -- e.g. real data kept in a
-    private folder while `root` only has an example/empty one.
+    The Setup page's shared mzML selection as full paths.
 
     Reads the persisted settings store directly rather than
     `st.session_state`, so it works no matter which page is currently active
@@ -117,12 +98,15 @@ def resolved_shared_mzml_files(root: str = DEFAULT_HRMS_DIR) -> list[str]:
     just Setup's own, and the store is what a loaded preset immediately
     updates regardless of which page happens to be mounted at the time.
     """
-    by_label = dict(find_mzml_files(root))
-    store = _settings_store()
-    labels = store.get(SHARED_MZML_KEY, [])
-    custom_text = store.get(f"{SHARED_MZML_KEY}_custom", "")
-    custom_paths = [line.strip() for line in custom_text.splitlines() if line.strip()]
-    return [by_label[label] for label in labels if label in by_label] + custom_paths
+    text = _settings_store().get(SHARED_MZML_KEY, "")
+    if isinstance(text, list):
+        # A preset saved before the discovered-files multiselect was
+        # dropped stores this key as a list of discovery *labels*, not full
+        # paths -- meaningless now that discovery is gone from the picker.
+        # Tolerate the shape so loading an old preset doesn't crash; it
+        # simply resolves to no files, same as if nothing were ever set.
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def _settings_store() -> dict:
@@ -286,3 +270,57 @@ def coming_soon(title: str, description: str):
 
     page_header(title, "Coming soon")
     st.info(description)
+
+
+# Possible right now (green) vs. not possible yet (yellow) -- the app's
+# standard way of showing an action's current status at a glance, first
+# built for Molecule Explorer's data loader and generalized here once it
+# proved out, to reuse across every module rather than reimplementing the
+# same colors/CSS per page.
+STATUS_GREEN = "#22c55e"
+STATUS_YELLOW = "#eab308"
+
+
+def status_button(label: str, key: str, ready: bool, status_text: str) -> bool:
+    """
+    A big button, color-coded by whether the action it performs is possible
+    right now (green) or not (yellow), with the reason directly underneath --
+    computed and shown on every render, not just after clicking.
+
+    Colors are CSS keyed on `key` (Streamlit generates a `.st-key-<key>`
+    class for exactly this purpose -- the only supported hook for a second
+    accent color beyond the theme's own `type="primary"/"secondary"`, which
+    doesn't offer more than one). `!important` on the disabled-state rule
+    too: Streamlit's own disabled-button styling (reduced opacity/grayed
+    border) would otherwise still show through and wash out the yellow.
+
+    Deliberately does not touch `width`/`min-width`/`max-width` on anything
+    outside its own button -- a past version of a *different* CSS override
+    in this app (the sidebar's) pinned a dimension with `!important` and
+    ended up fighting Streamlit's own resize handling; button dimensions
+    have no such conflict; sizing here is unaffected by that lesson, but the
+    caution against overriding more than the one property actually needed
+    still applies to future callers.
+    """
+    import streamlit as st
+
+    color = STATUS_GREEN if ready else STATUS_YELLOW
+    st.html(f"""
+        <style>
+        .st-key-{key} button {{
+            min-height: 4.5rem;
+            font-size: 1.05rem;
+            font-weight: 600;
+            border: 2px solid {color} !important;
+            color: {color} !important;
+        }}
+        .st-key-{key} button:disabled {{
+            border: 2px solid {color} !important;
+            color: {color} !important;
+            opacity: 0.85;
+        }}
+        </style>
+    """)
+    clicked = st.button(label, key=key, disabled=not ready, width="stretch")
+    st.caption(status_text)
+    return clicked

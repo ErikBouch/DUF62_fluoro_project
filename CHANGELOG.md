@@ -3,6 +3,66 @@
 Notable changes to this repository, newest first. Dated by when the change
 was committed (not necessarily the same day it's pushed).
 
+## 2026-08-04 — mzML Scan Detector gets a status button; simpler file picker; In-silico Library split into two workflows
+
+Sidebar width range narrowed to 10%-20% of screen width (was 14%-32%).
+
+mzML Scan Detector's "Find scans" action now shows immediately when the
+page opens (disabled/yellow with a reason until a file is picked), matching
+every other module -- previously the whole page was hidden behind a "pick a
+file first" gate with no visible action control at all.
+
+The mzML file picker (`common.ui.pick_mzml_files`, shared by mzML Scan
+Detector, MS Matching, and Setup) no longer offers a multiselect over files
+auto-discovered under `data/mzml/` alongside a separate custom-paths box --
+that discovery half went unused in practice, so it's now just the one text
+area of full paths.
+
+In-silico Library is now an explicit choice between two workflows: **Load
+existing library** (just view whatever's already on disk, or wherever the
+Setup page points) and **Generate a new library** (map a source and run
+Normalize/Build). Stats for a step only appear in the "Generate" workflow
+once *this session* has actually run it -- not just because a file happens
+to already exist from an earlier session, which previously made it
+impossible to tell a fresh result from stale leftovers, or to even choose
+between the two.
+
+## 2026-08-04 — Sidebar drag-resize fixed, redundant title removed, buttons generalized
+
+The narrower sidebar from earlier today pinned an exact pixel width with
+`!important`, which silently fought every drag-resize attempt (it looked
+frozen). Replaced with a percentage-based `min-width`/`max-width` range only
+-- the sidebar now actually scales with screen width and drags freely
+between those bounds.
+
+The app-level title/caption ("DUF62 Fluoro Project / Finding naturally
+fluoroacetylated...") used to render above every single page's own title,
+redundantly. Now shows only on the Setup landing page.
+
+Molecule Explorer's color-coded button pattern (green = possible, yellow =
+not yet, status line underneath) is now a shared helper
+(`common.ui.status_button`) and applied to In-silico Library's Normalize/
+Build buttons and to MS Matching's "reload saved result"/"view a saved
+variant"/"Run match" actions. Not applied to mzML Scan Detector or Setup --
+neither has an action that's ever actually "not possible" in the same way
+once its own precondition (a file picked) is already met, so a colored
+button there wouldn't carry real information.
+
+## 2026-08-04 — Explanatory hints, a narrower sidebar, and Molecule Explorer's color-coded buttons
+
+Added explanatory "?" hints to widgets where they genuinely clarify something
+non-obvious -- not a blanket pass over every widget. Covers: the main match
+tolerance and MS level selector on both mzML Scan Detector and MS Matching,
+relative-intensity's per-scan (not global) meaning, the absolute-intensity
+floor's relationship to that filter, the acetyl co-occurrence check's actual
+purpose, and the acetyl tolerance's independence from the main one.
+
+The sidebar is now a fixed, narrower width via CSS (no native Streamlit
+setting controls this). Molecule Explorer's three data-loading buttons are
+now large, color-coded (green when possible right now, yellow when not, with
+the reason underneath), and laid out side by side across the page's full
+width instead of stacked.
+
 ## 2026-08-03 — Fine-grained tolerances; Molecule Explorer's loader redesigned button-first
 
 MS Matching's MS2 precursor/ion tolerance and the acetyl co-occurrence

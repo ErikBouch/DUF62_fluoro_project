@@ -18,7 +18,7 @@ from common.run_log import append_run, render_run_log  # noqa: E402
 from common.ui import (  # noqa: E402
     SHARED_CANDIDATE_TABLE_KEY, SHARED_SUSPECT_LIBRARY_KEY,
     notify_done, page_header, persist, pick_mzml_files, render_last_notification,
-    resolved_shared_mzml_files, restore,
+    resolved_shared_mzml_files, restore, status_button,
 )
 from comparison import plotting  # noqa: E402
 from comparison.matcher import (  # noqa: E402
@@ -354,25 +354,20 @@ def _render_load_saved_result():
     externally, without a full "Run match".
     """
     saved = _find_saved_result()
-    if saved is None:
-        return
+    ready = saved is not None
+    if ready:
+        import datetime
 
-    import datetime
+        saved_when = datetime.datetime.fromtimestamp(saved["table_mtime"]).strftime("%Y-%m-%d %H:%M")
+        status = f"Possible -- found a result saved {saved_when} (already loaded automatically)."
+    else:
+        status = f"Not possible yet -- no saved result found at the default location (`{_OUTPUT_DIR}`)."
 
-    saved_when = datetime.datetime.fromtimestamp(saved["table_mtime"]).strftime("%Y-%m-%d %H:%M")
-    with st.expander(f"Load previously processed data (saved {saved_when})"):
-        st.caption(
-            f"Found `{saved['table_path']}`"
-            + (" and a saved collapsed-features table" if saved["features_path"] else "")
-            + " from an earlier run. Already loaded automatically when this page opened; use this "
-              "button to reload it (e.g. after changing the path on the Setup page, or if the file "
-              "changed since)."
-        )
-        if st.button("(Re)load saved result", key="cmp_load_saved"):
-            with st.spinner("Loading saved result from disk..."):
-                candidate_table = _load_saved_result(saved)
-            st.success(f"Loaded {len(candidate_table)} raw hits from disk.")
-            st.rerun()
+    if status_button("Reload saved result", "cmp_btn_reload_saved", ready, status):
+        with st.spinner("Loading saved result from disk..."):
+            candidate_table = _load_saved_result(saved)
+        st.success(f"Loaded {len(candidate_table)} raw hits from disk.")
+        st.rerun()
 
 
 # Every filter combination this page can produce ends up saved under
@@ -445,14 +440,27 @@ def _load_output_variant(path: str, label: str):
 
 
 def _render_output_variant_browser():
-    """Pick any saved result variant from `output/` and view it directly --
-    no need to re-run a match (or guess which filter is "currently active")
-    just to look at a specific already-computed subset."""
+    """
+    Pick any saved result variant from `output/` and view it directly -- no
+    need to re-run a match (or guess which filter is "currently active")
+    just to look at a specific already-computed subset. The button toggles
+    the actual selector open rather than loading anything itself (there's a
+    follow-up choice to make first), same pattern as Molecule Explorer's
+    "Load from a folder or file" -- always "possible" as long as at least
+    one variant exists on disk at all.
+    """
     variants = _discover_output_variants()
-    if not variants:
-        return
+    ready = bool(variants)
+    status = (
+        f"Possible -- {len(variants)} saved result variant(s) found."
+        if ready else f"Not possible yet -- no saved result variants found under `{_OUTPUT_DIR}`."
+    )
+    if status_button("View a saved result variant", "cmp_btn_variant_toggle", ready, status):
+        st.session_state["cmp_show_variant_picker"] = not st.session_state.get(
+            "cmp_show_variant_picker", False,
+        )
 
-    with st.expander("View a saved result from output/"):
+    if ready and st.session_state.get("cmp_show_variant_picker", False):
         st.caption(
             "Every filter combination this page produces is saved as its own file under "
             "`output/` the moment it's computed -- pick one to load and view it directly."
@@ -566,8 +574,11 @@ def render():
     c3.metric("Acetyl products", n_acetyl)
 
     _auto_load_saved_result_once()
-    _render_load_saved_result()
-    _render_output_variant_browser()
+    load_col1, load_col2 = st.columns(2)
+    with load_col1:
+        _render_load_saved_result()
+    with load_col2:
+        _render_output_variant_browser()
 
     st.divider()
     st.subheader("Files")
@@ -580,7 +591,12 @@ def render():
     restore("cmp_tolerance", 0.002)
     restore("cmp_unit", "Da", valid_options=["Da", "ppm"])
     col1, col2 = st.columns(2)
-    tolerance = col1.number_input("Tolerance", min_value=0.0, format="%.4f", key="cmp_tolerance")
+    tolerance = col1.number_input(
+        "Tolerance", min_value=0.0, format="%.4f", key="cmp_tolerance",
+        help="How close an observed m/z must be to one of the suspect library's target masses "
+             "to count as a match. Da is a fixed window at every mass; ppm scales with mass "
+             "(wider window for a heavier ion).",
+    )
     unit = col2.selectbox("Unit", ["Da", "ppm"], key="cmp_unit")
     persist("cmp_tolerance")
     persist("cmp_unit")
@@ -589,9 +605,20 @@ def render():
         restore("cmp_ms_level", "1", valid_options=["1", "2", "All"])
         restore("cmp_min_rel", 0)
         col3, col4 = st.columns(2)
-        ms_level_choice = col3.selectbox("MS level", ["1", "2", "All"], key="cmp_ms_level")
+        ms_level_choice = col3.selectbox(
+            "MS level", ["1", "2", "All"], key="cmp_ms_level",
+            help="MS1 = the instrument's regular full-scan spectra -- match against this for an "
+                 "intact compound's own mass, which is what the suspect library's target masses "
+                 "are. MS2 (fragment spectra from a selected precursor) is only meaningful here "
+                 "if a target mass happens to also be a known fragment.",
+        )
         ms_level = None if ms_level_choice == "All" else int(ms_level_choice)
-        min_rel_pct = col4.slider("Min. relative intensity (%)", 0, 100, key="cmp_min_rel")
+        min_rel_pct = col4.slider(
+            "Min. relative intensity (%)", 0, 100, key="cmp_min_rel",
+            help="Relative to each scan's own tallest peak, not one global maximum across the "
+                 "file -- the same absolute intensity can pass in a quiet scan and fail in a "
+                 "busy one.",
+        )
         min_rel = min_rel_pct / 100.0
         persist("cmp_ms_level")
         persist("cmp_min_rel")
@@ -623,6 +650,10 @@ def render():
         check_acetyl = st.checkbox(
             "Require checking the acetyl analog too (co-occurrence)",
             key="cmp_check_acetyl",
+            help="Also looks for the same parent compound's acetyl (non-fluorinated) analog "
+                 "nearby -- a fluoroacetylated hit is more credible when its ordinary "
+                 "acetylated counterpart is also present, since both would come from the same "
+                 "underlying acylation chemistry.",
         )
         persist("cmp_check_acetyl")
         acetyl_tolerance, acetyl_unit, acetyl_rt_window = 5.0, "ppm", 2.0
@@ -633,6 +664,8 @@ def render():
             col5, col6 = st.columns(2)
             acetyl_tolerance = col5.number_input(
                 "Acetyl tolerance", min_value=0.0, format="%.4f", key="cmp_acetyl_tolerance",
+                help="Independent from the main match tolerance above -- the acetyl analog can "
+                     "reasonably need a looser or tighter window of its own.",
             )
             acetyl_unit = col6.selectbox("Acetyl unit", ["ppm", "Da"], key="cmp_acetyl_unit")
             acetyl_rt_window = st.number_input(
@@ -663,9 +696,12 @@ def render():
 
     st.divider()
 
-    if not file_paths:
-        st.info("Pick at least one mzML file to run a match.")
-    elif st.button("Run match", type="primary"):
+    run_ready = bool(file_paths)
+    run_status = (
+        f"Possible -- {len(file_paths)} mzML file(s) selected." if run_ready
+        else "Not possible yet -- pick at least one mzML file above."
+    )
+    if status_button("Run match", "cmp_btn_run_match", run_ready, run_status):
         candidate_table = _run_match(library, file_paths)
         notify_done("comparison_run_match", f"Match finished -- {len(candidate_table)} raw hits across {len(file_paths)} file(s).")
 

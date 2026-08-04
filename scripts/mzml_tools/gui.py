@@ -12,7 +12,9 @@ import sys
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.ui import page_header, persist, pick_mzml_files, resolved_shared_mzml_files, restore  # noqa: E402
+from common.ui import (  # noqa: E402
+    page_header, persist, pick_mzml_files, resolved_shared_mzml_files, restore, status_button,
+)
 from mzml_tools.scan_detector import (  # noqa: E402
     extract_ion_chromatogram,
     find_scans_with_mz,
@@ -142,39 +144,22 @@ def render():
     )
 
     _, path = _pick_files()
-    if not path or not os.path.isfile(path):
-        st.info("Pick or enter an .mzML file to begin.")
-        return
+    ready = bool(path and os.path.isfile(path))
 
-    mtime = os.path.getmtime(path)
-    with st.spinner("Reading file overview..."):
-        overview = _cached_overview(path, mtime)
-
-    with st.expander("File overview", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Spectra", overview.n_spectra)
-        c2.metric("Polarity", "/".join(overview.polarity_counts))
-        c3.metric(
-            "RT range",
-            f"{overview.rt_range_minutes[0]:.1f}-{overview.rt_range_minutes[1]:.1f} min",
-        )
-        st.caption("MS levels: " + ", ".join(f"MS{k}: {v} scans" for k, v in sorted(overview.ms_level_counts.items())))
-        for lvl, (lo, hi) in sorted(overview.mz_range_by_level.items()):
-            st.caption(f"MS{lvl} observed m/z range: {lo:.3f} - {hi:.3f}")
-        st.caption(
-            "On some instruments/methods, the MS1 scan range doesn't extend down to very "
-            "low m/z, so small fragment ions may only be observable as MS2 product ions."
-        )
-
-    # Restored *before* `_render_diagnostic_targets` below, not after: its
-    # "Explore" button reads these same keys directly (it reuses the
-    # single-target search against whatever tolerance/unit/etc. are
-    # currently set), and reading them before they've been restored this
-    # render would silently fall back to the hardcoded defaults below
-    # instead of the user's actual saved settings -- same class of bug as
-    # the shared mzML/library-path keys elsewhere in this app. `restore()`
-    # is a no-op the second time it's called for an already-set key, so the
-    # widgets further down are unaffected by restoring these this early.
+    # Restored here, before anything below reads these keys -- including
+    # `_render_diagnostic_targets`'s "Explore" button, which reuses whatever
+    # tolerance/unit/etc. are currently set, and reading them before they've
+    # been restored this render would silently fall back to the hardcoded
+    # defaults below instead of the user's actual saved settings -- same
+    # class of bug as the shared mzML/library-path keys elsewhere in this
+    # app. `restore()` is a no-op the second time it's called for an
+    # already-set key, so the widgets further down are unaffected by
+    # restoring these this early, and doing it before the `ready` gate below
+    # (rather than only once a file exists) means the filter widgets and the
+    # "Find scans" status button can render regardless of whether a file's
+    # picked yet -- matching every other module's page, where the run
+    # button and its own settings are always visible, not hidden behind a
+    # precondition.
     restore("scan_target_mz", 100.0)
     restore("scan_tolerance", 25.0)
     restore("scan_unit", "ppm", valid_options=["ppm", "Da"])
@@ -182,33 +167,82 @@ def render():
     restore("scan_min_rel", 2)
     restore("scan_threshold", 0.0)
 
-    _render_diagnostic_targets(path, mtime)
+    if ready:
+        mtime = os.path.getmtime(path)
+        with st.spinner("Reading file overview..."):
+            overview = _cached_overview(path, mtime)
+
+        with st.expander("File overview", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Spectra", overview.n_spectra)
+            c2.metric("Polarity", "/".join(overview.polarity_counts))
+            c3.metric(
+                "RT range",
+                f"{overview.rt_range_minutes[0]:.1f}-{overview.rt_range_minutes[1]:.1f} min",
+            )
+            st.caption("MS levels: " + ", ".join(f"MS{k}: {v} scans" for k, v in sorted(overview.ms_level_counts.items())))
+            for lvl, (lo, hi) in sorted(overview.mz_range_by_level.items()):
+                st.caption(f"MS{lvl} observed m/z range: {lo:.3f} - {hi:.3f}")
+            st.caption(
+                "On some instruments/methods, the MS1 scan range doesn't extend down to very "
+                "low m/z, so small fragment ions may only be observable as MS2 product ions."
+            )
+
+        _render_diagnostic_targets(path, mtime)
 
     col1, col2, col3 = st.columns(3)
     target_mz = col1.number_input("Target m/z", format="%.4f", key="scan_target_mz")
-    tolerance = col2.number_input("Tolerance", min_value=0.1, key="scan_tolerance")
+    tolerance = col2.number_input(
+        "Tolerance", min_value=0.1, key="scan_tolerance",
+        help="How far a scan's peak m/z may be from the target and still count as a match. "
+             "ppm scales with mass (wider window for a heavier ion); Da is a fixed window at "
+             "every mass.",
+    )
     unit = col3.selectbox("Unit", ["ppm", "Da"], key="scan_unit")
     persist("scan_target_mz")
     persist("scan_tolerance")
     persist("scan_unit")
 
     col4, col5 = st.columns(2)
-    ms_level_choice = col4.selectbox("MS level", ["All", "1", "2"], key="scan_ms_level")
+    ms_level_choice = col4.selectbox(
+        "MS level", ["All", "1", "2"], key="scan_ms_level",
+        help="MS1 = the instrument's regular full-scan spectra (an intact compound's own mass). "
+             "MS2 = fragment spectra recorded after selecting one precursor mass -- only "
+             "meaningful for a target that's actually a fragment ion, not a whole molecule.",
+    )
     ms_level = None if ms_level_choice == "All" else int(ms_level_choice)
-    min_rel_pct = col5.slider("Min. relative intensity (% of that scan's base peak)", 0, 100, key="scan_min_rel")
+    min_rel_pct = col5.slider(
+        "Min. relative intensity (% of that scan's base peak)", 0, 100, key="scan_min_rel",
+        help="Relative to each scan's own tallest peak, not one global maximum across the whole "
+             "file -- the same absolute intensity can pass in a quiet scan and fail in a busy one.",
+    )
     min_rel = min_rel_pct / 100.0
     persist("scan_ms_level")
     persist("scan_min_rel")
 
     with st.expander("Advanced"):
-        threshold = st.number_input("Min. absolute intensity (0 = off)", min_value=0.0, key="scan_threshold")
+        threshold = st.number_input(
+            "Min. absolute intensity (0 = off)", min_value=0.0, key="scan_threshold",
+            help="Raw instrument units, applied in addition to the relative-intensity filter "
+                 "above -- a peak below this never counts as a hit, however high its relative "
+                 "intensity is; 0 disables it.",
+        )
         persist("scan_threshold")
 
-    if st.button("Find scans", type="primary"):
+    status = (
+        "Possible -- ready to search." if ready
+        else "Not possible yet -- pick or enter an mzML file above."
+    )
+    if status_button("Find scans", "scan_btn_find", ready, status):
         with st.spinner("Searching spectra..."):
-            matches = _cached_search(path, mtime, target_mz, tolerance, unit, threshold, min_rel, ms_level)
+            matches = _cached_search(
+                path, os.path.getmtime(path), target_mz, tolerance, unit, threshold, min_rel, ms_level,
+            )
         st.session_state["scan_matches"] = matches
         st.session_state["scan_matches_mz"] = target_mz
+
+    if not ready:
+        return
 
     matches = st.session_state.get("scan_matches")
     if matches is None:
